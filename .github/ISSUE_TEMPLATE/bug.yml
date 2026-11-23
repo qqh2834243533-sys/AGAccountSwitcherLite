@@ -1,0 +1,17 @@
+name: Bug report
+description: Report a problem in the simulation or build.
+title: "bug: "
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: Tool version and Windows build
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Simulation scenario, steps, expected and observed results
+      description: Do not include real account details, credentials, private logs, or Antigravity files.
+    validations:
+      required: true

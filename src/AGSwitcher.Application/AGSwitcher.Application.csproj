@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <ItemGroup>
+        <ProjectReference Include="../AGSwitcher.Domain/AGSwitcher.Domain.csproj" />
+    </ItemGroup>
+</Project>
