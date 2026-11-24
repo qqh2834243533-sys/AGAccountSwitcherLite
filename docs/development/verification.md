@@ -1,5 +1,21 @@
 # 0.1.0 验证与准入记录 (Verification Log)
 
+## 2026-11-24 `v0.1.0` GitHub 正式发布记录
+
+- **远端仓库**：`https://github.com/qqh2834243533-sys/AGAccountSwitcherLite`
+- **已推送分支与标签**：`main`、`archive/dotnet-simulation-prototype`（`db7e6b9`），正式发布标签 `v0.1.0`（Commit `24ac0db`）。
+- **发布前收尾修复（`24ac0db`）**：
+  - 修复 `src/client.rs` 中 `clippy::collapsible_if` 告警，确保本地与云端 `cargo clippy --locked --all-targets -- -D warnings` 零告警通过；
+  - 在 `scripts/package.ps1` 的 SBOM 扫描临时目录生成最小 `src/main.rs` 桩文件，消除微软 `sbom-tool` 调用 `cargo metadata` 时的回退告警（完整解析 502 个 Rust 依赖组件）；
+  - 更新 `.github/ISSUE_TEMPLATE/bug.yml` 为正式版桌面切换器反馈模板。
+- **GitHub Release 产物与校验值**：
+  - 发布页：`https://github.com/qqh2834243533-sys/AGAccountSwitcherLite/releases/tag/v0.1.0`
+  - `ag-account-switcher-lite-0.1.0-win-x64.zip`（SHA-256：`5bd5eb5c8df5b4708e90424a05b7cf1488f05691d358991e3c5287864a2c2810`，与 GitHub 远端资产摘要一致）
+  - 随附上传 `.zip.sha256`、`.spdx.json`（SPDX 2.2 SBOM）及 `NOTICE.md`。
+- **GitHub Actions 状态**：已启用仓库 Actions 权限（`actions.enabled = true`），`Windows CI` 工作流（Run `#45364091261`）云端格式检查、Clippy 严格门禁与全部系统凭据夹具单元测试均已通过。
+
+---
+
 ## 2026-11-24 主仓架构归一与发布准入整改验收
 
 环境：Windows 11 26H2 x64（Build `26300.9974`），Cargo `1.100.0`（MSVC x64），本地离线锁定依赖与微软 `sbom-tool` v4.1.5。
