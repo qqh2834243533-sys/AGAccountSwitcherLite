@@ -1,7 +1,7 @@
 const chinese = navigator.language.toLowerCase().startsWith("zh");
 const strings = {
   title: ["Antigravity 账号", "Antigravity accounts"],
-  intro: ["点击已保存的账号，在原生 App 中打开。", "Click a saved account to open Antigravity."],
+  intro: ["点击账号或按数字键 1–4 切换，关闭窗口自动驻留系统托盘。", "Click an account or press 1–4 to switch; closing hides to the system tray."],
   register: ["登记当前账号", "Save current account"],
   restore: ["恢复切换前会话", "Restore previous session"],
   forget: ["清除恢复记录", "Clear recovery record"],
@@ -12,6 +12,34 @@ const strings = {
   remove: ["移除", "Remove"],
   alias: ["账号名称", "Account label"],
   activeBadge: ["当前", "Active"],
+  autostartLabel: ["开机自启", "Launch at startup"],
+  hotkeyTitle: ["快速唤出", "Quick summon"],
+  editHotkey: ["修改", "Change"],
+  disableHotkey: ["禁用", "Disable"],
+  hotkeyDisabled: ["已禁用", "Disabled"],
+  recordingBadge: ["请按键…", "Press keys…"],
+  recordingPrompt: [
+    "请按下包含 Ctrl / Alt / Win 的组合键，按 Esc 取消。",
+    "Press a shortcut with Ctrl, Alt, or Win (Esc to cancel)."
+  ],
+  autostartEnabled: ["已开启开机自启（开机静默驻留托盘）。", "Launch at startup enabled (starts silently in tray)."],
+  autostartDisabled: ["已关闭开机自启。", "Launch at startup disabled."],
+  autostartBlockedNotice: [
+    "开机自启已在 Windows 系统启动项设置中被禁用，请在任务管理器或系统设置中开启。",
+    "Startup is disabled by Windows Startup settings. Re-enable it in Task Manager or Settings."
+  ],
+  hotkeySaved: ["已更新快速唤出热键。", "Quick summon shortcut updated."],
+  hotkeyCleared: ["已禁用快速唤出热键。", "Quick summon shortcut disabled."],
+  hotkey_conflict: [
+    "该热键已被其他程序占用，请点击「修改」更换组合键。",
+    "That shortcut is already in use by another app. Click “Change” to pick another."
+  ],
+  hotkey_unavailable: ["无法向系统注册该热键，请更换其他组合键。", "Windows could not register that shortcut. Try another combination."],
+  invalid_hotkey: [
+    "无效热键：须包含 Ctrl / Alt / Win 修饰键且不能占用系统保留热键。",
+    "Invalid shortcut: include Ctrl, Alt, or Win and avoid reserved system shortcuts."
+  ],
+  autostart_unavailable: ["无法写入当前用户的开机自启注册表项。", "Could not update the current user’s startup registry entry."],
   loading: ["正在读取账号…", "Loading accounts…"],
   busy: ["正在处理…", "Working…"],
   ready: ["选择一个账号。", "Choose an account."],
@@ -21,8 +49,8 @@ const strings = {
     "An unsaved account is signed in. Click “Save current account” to register it."
   ],
   guidance: [
-    "首次在官方 Antigravity 登录后，在此登记当前账号（最多四个）。客户端运行时切换会先请求确认并向可见窗口发送关闭信号；若窗口未关闭则安全中止，仅在窗口退入后台后收尾驻留进程并保留合法启动参数重开 App。",
-    "Sign in through official Antigravity first, then save up to four accounts here. When Antigravity is running, Lite asks for confirmation and sends a close request to visible windows; if any window stays open, switching aborts safely, and tray-resident processes are cleaned up only after windows close before reopening with sanitized launch flags."
+    "首次在官方 Antigravity 登录后，在此登记当前账号（最多四个）。热键可随时唤出或收起窗口（窗口内按 Esc 亦可收起回托盘，真正退出请使用托盘右键菜单）。客户端运行时切换会先请求确认并发送关闭信号；若窗口未关闭则安全中止。",
+    "Sign in through official Antigravity first, then save up to four accounts here. Use the global shortcut to summon or hide this window (Esc also hides to tray; use the tray menu to quit). Running switches ask for confirmation first and abort safely if any window stays open."
   ],
   opened: [
     "已打开 Antigravity。请在原生 App 核对账号。若出现登录页，请用官方流程重新登录。",
@@ -88,17 +116,29 @@ const strings = {
   operation_failed: ["操作没有完成。请重试。", "The operation did not complete. Try again."],
 };
 
+const CODE_KEY_MAP = {
+  Space: "Space", Tab: "Tab", Enter: "Enter", Backspace: "Backspace",
+  Insert: "Insert", Delete: "Delete", Home: "Home", End: "End",
+  PageUp: "PageUp", PageDown: "PageDown",
+  ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right",
+  Backquote: "`", Minus: "-", Equal: "=", BracketLeft: "[", BracketRight: "]",
+  Backslash: "\\", Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/",
+};
+
 const t = key => (strings[key] ?? strings.operation_failed)[chinese ? 0 : 1];
 const byId = id => document.getElementById(id);
 const api = window.__TAURI__?.core;
 let current;
 let working = false;
 let registration = false;
+let recording = false;
+let recordingPreview = "";
 
 document.documentElement.lang = chinese ? "zh-CN" : "en";
 for (const [id, key] of Object.entries({
   title: "title", intro: "intro", register: "register", restore: "restore", forget: "forget",
   reload: "reload", save: "save", "cancel-registration": "cancel", "label-title": "alias",
+  "autostart-label": "autostartLabel", "hotkey-title": "hotkeyTitle",
   guidance: "guidance", no: "cancel", yes: "yes",
 })) {
   byId(id).textContent = t(key);
@@ -120,8 +160,27 @@ function button(label, cssClass, action) {
   return element;
 }
 
+function mapEventMainKey(event) {
+  const { code, key } = event;
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^F([1-9]|1[0-2])$/.test(code)) return code;
+  if (CODE_KEY_MAP[code]) return CODE_KEY_MAP[code];
+  if (key && key.length === 1 && /[a-z0-9]/i.test(key)) return key.toUpperCase();
+  return null;
+}
+
+function formatModifiers(event) {
+  const parts = [];
+  if (event.ctrlKey) parts.push("Ctrl");
+  if (event.altKey) parts.push("Alt");
+  if (event.shiftKey) parts.push("Shift");
+  if (event.metaKey) parts.push("Win");
+  return parts;
+}
+
 async function requestSwitch(slot) {
-  if (working) return;
+  if (working || recording) return;
   try {
     await load();
     render();
@@ -160,10 +219,16 @@ function render() {
     open.className = isActive ? "account is-active" : "account";
     if (isActive) open.setAttribute("aria-current", "true");
 
+    const left = document.createElement("span");
+    left.className = "account-main";
+    const keyHint = document.createElement("kbd");
+    keyHint.className = "slot-key";
+    keyHint.textContent = String(slot);
     const nameSpan = document.createElement("span");
     nameSpan.className = "account-label";
     nameSpan.textContent = label;
-    open.append(nameSpan);
+    left.append(keyHint, nameSpan);
+    open.append(left);
 
     if (isActive) {
       const badge = document.createElement("span");
@@ -178,14 +243,14 @@ function render() {
       if (await confirmAction("removePrompt")) await operate("remove_account", { slot }, "removed");
     });
     remove.setAttribute("aria-label", t("remove") + " " + label);
-    open.disabled = working || needsRecovery || !current.appInstalled;
-    remove.disabled = working || needsRecovery;
+    open.disabled = working || recording || needsRecovery || !current.appInstalled;
+    remove.disabled = working || recording || needsRecovery;
     row.append(open, remove);
     list.append(row);
   }
   byId("count").hidden = !current;
   byId("count").textContent = accounts.length + " / 4";
-  byId("register").disabled = working || needsRecovery || !current?.appInstalled || accounts.length >= 4;
+  byId("register").disabled = working || recording || needsRecovery || !current?.appInstalled || accounts.length >= 4;
   byId("register").hidden = registration;
   byId("registration").hidden = !registration;
   byId("save").disabled = working;
@@ -193,10 +258,36 @@ function render() {
   byId("cancel-registration").disabled = working;
   for (const id of ["restore", "forget"]) {
     byId(id).hidden = !current?.recovery;
-    byId(id).disabled = working;
+    byId(id).disabled = working || recording;
   }
   byId("reload").hidden = Boolean(current);
-  byId("reload").disabled = working;
+  byId("reload").disabled = working || recording;
+
+  const autostartBox = byId("autostart");
+  autostartBox.checked = Boolean(current?.autostart);
+  autostartBox.disabled = working || recording || !current;
+
+  const hotkeyDisplay = byId("hotkey-display");
+  const hasHotkey = Boolean(current?.hotkey);
+  const isConflict = current?.hotkeyStatus === "conflict";
+  if (recording) {
+    hotkeyDisplay.textContent = recordingPreview || t("recordingBadge");
+  } else {
+    hotkeyDisplay.textContent = hasHotkey ? current.hotkey : t("hotkeyDisabled");
+  }
+  hotkeyDisplay.classList.toggle("is-recording", recording);
+  hotkeyDisplay.classList.toggle("is-conflict", !recording && isConflict);
+  hotkeyDisplay.classList.toggle("is-muted", !recording && !hasHotkey);
+
+  const editBtn = byId("hotkey-edit");
+  const clearBtn = byId("hotkey-clear");
+  editBtn.textContent = t("editHotkey");
+  editBtn.hidden = recording;
+  editBtn.disabled = working || !current;
+
+  clearBtn.textContent = recording ? t("cancel") : t("disableHotkey");
+  clearBtn.hidden = !recording && !hasHotkey;
+  clearBtn.disabled = working || !current;
 }
 
 function confirmAction(key) {
@@ -213,9 +304,20 @@ async function load() {
   current = await api.invoke("overview");
 }
 
+function applyShellStatus(shell) {
+  if (!current || !shell) return;
+  current.autostart = shell.autostart;
+  current.autostartBlocked = shell.autostartBlocked;
+  current.hotkey = shell.hotkey;
+  current.hotkeyStatus = shell.hotkeyStatus;
+}
+
 function showStatus() {
+  if (!current) return;
   if (!current.appInstalled) notice("app_missing", true);
   else if (current.recovery === "pending") notice("recovery_required", true);
+  else if (current.hotkeyStatus === "conflict") notice("hotkey_conflict", true);
+  else if (current.autostart && current.autostartBlocked) notice("autostartBlockedNotice", true);
   else if (current.unregisteredActive && current.accounts.length < 4) notice("unregisteredStatus");
   else if (current.clientRunning) notice("runningStatus");
   else notice(current.accounts.length ? "ready" : "empty");
@@ -236,6 +338,50 @@ async function operate(command, arguments_, success) {
     notice(success);
   } catch (error) {
     try { await load(); } catch { current = undefined; }
+    notice(typeof error === "string" ? error : "operation_failed", true);
+  } finally {
+    working = false;
+    render();
+  }
+}
+
+async function startRecording() {
+  if (working || recording || !current) return;
+  recording = true;
+  recordingPreview = "";
+  render();
+  notice("recordingPrompt");
+  try {
+    await api.invoke("set_hotkey_suspended", { suspended: true });
+  } catch {
+    // Best effort suspension while capturing keystrokes.
+  }
+}
+
+async function cancelRecording(restoreNotice = true) {
+  if (!recording) return;
+  recording = false;
+  recordingPreview = "";
+  try {
+    await api.invoke("set_hotkey_suspended", { suspended: false });
+  } catch {
+    // Ignore
+  }
+  render();
+  if (restoreNotice) showStatus();
+}
+
+async function submitHotkey(hotkey, successKey) {
+  working = true;
+  recording = false;
+  recordingPreview = "";
+  render();
+  try {
+    const shell = await api.invoke("set_hotkey", { hotkey });
+    applyShellStatus(shell);
+    notice(successKey);
+  } catch (error) {
+    try { await load(); } catch { /* keep current */ }
     notice(typeof error === "string" ? error : "operation_failed", true);
   } finally {
     working = false;
@@ -278,4 +424,92 @@ byId("forget").addEventListener("click", async () => {
   if (await confirmAction("forgetPrompt")) await operate("discard_recovery", {}, "cleared");
 });
 byId("reload").addEventListener("click", initialize);
+
+byId("autostart").addEventListener("change", async event => {
+  const enabled = event.target.checked;
+  working = true;
+  render();
+  try {
+    const shell = await api.invoke("set_autostart", { enabled });
+    applyShellStatus(shell);
+    if (shell.autostart && shell.autostartBlocked) {
+      notice("autostartBlockedNotice", true);
+    } else {
+      notice(shell.autostart ? "autostartEnabled" : "autostartDisabled");
+    }
+  } catch (error) {
+    try { await load(); } catch { /* ignore */ }
+    notice(typeof error === "string" ? error : "operation_failed", true);
+  } finally {
+    working = false;
+    render();
+  }
+});
+
+byId("hotkey-edit").addEventListener("click", () => void startRecording());
+byId("hotkey-clear").addEventListener("click", () => {
+  if (recording) void cancelRecording(true);
+  else void submitHotkey(null, "hotkeyCleared");
+});
+
+window.addEventListener("blur", () => {
+  if (recording) void cancelRecording(true);
+});
+
+window.addEventListener("focus", async () => {
+  if (working || registration || recording || byId("confirm").open) return;
+  try {
+    await load();
+    render();
+    showStatus();
+  } catch {
+    // Keep last rendered state if background refresh fails.
+  }
+});
+
+document.addEventListener("keydown", event => {
+  if (recording) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
+      void cancelRecording(true);
+      return;
+    }
+    const mods = formatModifiers(event);
+    const mainKey = mapEventMainKey(event);
+    if (!mainKey) {
+      recordingPreview = mods.length ? mods.join("+") + "+…" : "";
+      render();
+      return;
+    }
+    void submitHotkey([...mods, mainKey].join("+"), "hotkeySaved");
+    return;
+  }
+
+  if (working || registration || byId("confirm").open) return;
+  const activeTag = document.activeElement?.tagName;
+  if (activeTag === "INPUT" || activeTag === "TEXTAREA") return;
+
+  if (event.key === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
+    event.preventDefault();
+    void api.invoke("hide_window");
+    return;
+  }
+
+  if (!event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey && /^[1-4]$/.test(event.key)) {
+    const slot = Number(event.key);
+    if (current?.accounts?.some(item => item.slot === slot)) {
+      event.preventDefault();
+      void requestSwitch(slot);
+    }
+  }
+});
+
+document.addEventListener("keyup", event => {
+  if (!recording) return;
+  const mods = formatModifiers(event);
+  recordingPreview = mods.length ? mods.join("+") + "+…" : "";
+  render();
+});
+
 void initialize();

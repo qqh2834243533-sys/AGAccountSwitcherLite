@@ -1,4 +1,17 @@
-# 0.1.0 验证与准入记录 (Verification Log)
+# 验证与准入记录 (Verification Log)
+
+## 2026-11-24 `v0.1.1` 托盘常驻、开机自启与自定义快速唤出发布验证
+
+- **核心改动范围**：新增单一壳层模块 `src/shell.rs` 并最小化扩展 `src/main.rs` 与 `ui/`；核心安全层（`vault.rs`、`service.rs`、`client.rs`、`switch_lock.rs`）及 `capabilities/main.json`（`permissions: []`）保持 0 行改动，SPDX 2.2 SBOM 维持 502 个 Rust 依赖组件零膨胀。
+- **离线质量门禁与夹具测试**：
+  - `cargo fmt --all -- --check` 与 `cargo clippy --locked --offline --all-targets -- -D warnings` 零差异、零告警通过；
+  - `cargo test --locked --offline` **24 项通过 / 0 失败 / 4 项真机或子进程辅助忽略用例**（新增隔离注册表子键自启写入/引号包裹/路径漂移自愈/`StartupApproved` 禁用检测测试、热键解析黑名单测试、`shell.json` 损坏恢复测试及多线程热键冲突 `1409` / 挂起恢复集成测试）。
+- **GitHub Release 产物与校验值**：
+  - 发布页：`https://github.com/qqh2834243533-sys/AGAccountSwitcherLite/releases/tag/v0.1.1`
+  - `ag-account-switcher-lite-0.1.1-win-x64.zip`（SHA-256：`0f2458fbdcb49b6f446e9289808b90ba226139a8aca68343baafde0312d8d0e1`）
+  - 随附上传 `.zip.sha256`、`.spdx.json`（`sbom-tool validate` 零错误通过）及 `NOTICE.md`。
+
+---
 
 ## 2026-11-24 `v0.1.0` GitHub 正式发布记录
 

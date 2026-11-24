@@ -2,14 +2,15 @@
 
 ## 模块分层
 
-AG Account Switcher Lite (`0.1.0`) 是面向 Windows 11 x64 的单可执行文件 Tauri 2 应用，由四个高内聚层组成：
+AG Account Switcher Lite (`0.1.1`) 是面向 Windows 11 x64 的单可执行文件 Tauri 2 应用，由四个高内聚层组成：
 
 1. **WebView2 表现层 (`ui/index.html`, `ui/app.js`, `ui/style.css`)**
    - 原生 HTML/CSS/JS 实现，零第三方前端框架依赖，启用严格 CSP 且 `capabilities/main.json` 权限集为空（`permissions: []`）。
-   - 仅接收脱敏后的槽位编号（`1..=4`）、备注名称、当前活动槽位标识及恢复状态；当检测到客户端正在运行时弹出轻量切换确认对话框。
-2. **IPC 与互斥入口层 (`src/main.rs`, `src/switch_lock.rs`)**
-   - 注册 `tauri-plugin-single-instance` 保证同一会话内单窗口实例；
-   - 所有命令统一在 `with_vault` 阻塞池任务中持有 `SwitchLock`（`account-switch.lock`, `share_mode(0)`），保证进程内与跨进程串行互斥。
+   - 仅接收脱敏后的槽位编号（`1..=4`）、备注名称、当前活动槽位标识、恢复状态及自启/热键壳层状态；支持自定义热键录制、数字键 `1`–`4` 切号与 `Esc` 隐藏回托盘，客户端正在运行时弹出轻量切换确认对话框。
+2. **IPC、桌面壳层与互斥入口层 (`src/main.rs`, `src/shell.rs`, `src/switch_lock.rs`)**
+   - 注册 `tauri-plugin-single-instance` 保证同一会话内单窗口实例，二次运行自动唤醒托盘隐藏窗口（`--autostart` 开机静默入驻托盘）；
+   - `shell.rs` 统一管理系统托盘常驻、当前用户注册表 `HKCU\...\Run` 开机自启（含便携目录迁移路径自愈）与独立 Win32 消息循环全局热键线程（`shell.json` 原子持久化自定义热键）；
+   - 所有凭据命令统一在 `with_vault` 阻塞池任务中持有 `SwitchLock`（`account-switch.lock`, `share_mode(0)`）与活跃事务计数保护，保证进程内与跨进程串行互斥且防止切号中途托盘强退。
 3. **切换与恢复事务层 (`src/service.rs`)**
    - 管理最多 4 个槽位登记、移除、切号、回读验证与失败自动回滚；
    - 维护 `Journal` 恢复记录（`p1`/`p0` 挂起态与 `r1`/`r0` 就绪态），并在切出或执行会话恢复前通过 `same_account()`（比对 JWT `sub` 或 `refresh_token`）将官方后台自动刷新的最新凭据回写至对应槽位。

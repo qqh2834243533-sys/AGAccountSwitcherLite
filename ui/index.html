@@ -32,6 +32,18 @@
       <button id="forget" type="button" hidden>清除恢复记录</button>
       <button id="reload" type="button" hidden>重试</button>
     </footer>
+    <section class="shell-bar" id="shell-bar">
+      <label class="toggle">
+        <input id="autostart" type="checkbox">
+        <span id="autostart-label">开机自启</span>
+      </label>
+      <div class="hotkey-row">
+        <span id="hotkey-title" class="muted-label">快速唤出</span>
+        <kbd id="hotkey-display">Alt+Shift+G</kbd>
+        <button id="hotkey-edit" type="button" class="compact">修改</button>
+        <button id="hotkey-clear" type="button" class="compact" hidden>禁用</button>
+      </div>
+    </section>
     <p id="guidance"></p>
     <dialog id="confirm">
       <form method="dialog">
