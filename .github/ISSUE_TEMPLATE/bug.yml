@@ -1,17 +1,17 @@
 name: Bug report
-description: Report a problem in the simulation or build.
+description: Report a problem in AG Account Switcher Lite or its build.
 title: "bug: "
 body:
   - type: input
     id: environment
     attributes:
-      label: Tool version and Windows build
+      label: Switcher version, Antigravity version, and Windows 11 build
     validations:
       required: true
   - type: textarea
     id: reproduction
     attributes:
-      label: Simulation scenario, steps, expected and observed results
-      description: Do not include real account details, credentials, private logs, or Antigravity files.
+      label: Steps to reproduce, expected behavior, and observed results
+      description: Do not include real account emails, OAuth tokens, Credential Manager exports, private logs, or Antigravity session files.
     validations:
       required: true

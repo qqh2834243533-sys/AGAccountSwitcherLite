@@ -530,11 +530,9 @@ pub fn save_launch_plan(data_root: &Path, plan: &LaunchPlan) {
     };
     let final_path = data_root.join(LAUNCH_CONTEXT_FILE);
     let temp_path = data_root.join(format!("{LAUNCH_CONTEXT_FILE}.{}.tmp", std::process::id()));
-    if fs::write(&temp_path, &serialized).is_ok() {
-        if fs::rename(&temp_path, &final_path).is_err() {
-            let _ = fs::write(&final_path, &serialized);
-            let _ = fs::remove_file(&temp_path);
-        }
+    if fs::write(&temp_path, &serialized).is_ok() && fs::rename(&temp_path, &final_path).is_err() {
+        let _ = fs::write(&final_path, &serialized);
+        let _ = fs::remove_file(&temp_path);
     }
 }
 

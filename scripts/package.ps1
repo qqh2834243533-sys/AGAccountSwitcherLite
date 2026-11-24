@@ -64,6 +64,9 @@ try {
 
     if ($SbomTool) {
         Copy-Item -LiteralPath (Join-Path $root 'Cargo.toml'), (Join-Path $root 'Cargo.lock') -Destination $componentScan -Force
+        $scanSrc = Join-Path $componentScan 'src'
+        New-Item -ItemType Directory -Force -Path $scanSrc | Out-Null
+        Set-Content -Encoding ascii -LiteralPath (Join-Path $scanSrc 'main.rs') -Value 'fn main() {}'
         & $SbomTool generate -b $staging -bc $componentScan -pn 'AG Account Switcher Lite' -pv $version -ps 'AG Account Switcher Lite contributors' -mi 'SPDX:2.2'
         if ($LASTEXITCODE -ne 0) {
             throw "SBOM generation failed ($LASTEXITCODE)"
