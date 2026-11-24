@@ -1,34 +1,29 @@
-# 在 Windows 构建和测试
+# 构建与测试说明 (Build Guide)
 
-需要 Git 与 .NET 10 SDK x64。使用 global.json 固定的 SDK 构建候选包。本机已有项目私有 SDK，可在仓库根目录执行 .\.local\dotnet\dotnet.exe --info 核对。
+## 环境要求
 
-~~~powershell
-dotnet restore AGSwitcher.sln --locked-mode --force-evaluate
-dotnet build AGSwitcher.sln -c Release --no-restore -p:ContinuousIntegrationBuild=true
-dotnet test AGSwitcher.sln -c Release --no-build --no-restore
-.\scripts\package.ps1
-~~~
+- Windows 11 x64
+- Rust Stable 工具链（`x86_64-pc-windows-msvc`）
+- Visual Studio 2022 C++ Build Tools 与 Windows 10/11 SDK
+- Microsoft Edge WebView2 Runtime（Windows 11 默认内置）
 
-NuGet 还原仅使用 nuget.org。锁文件记录解析版本和内容哈希，NuGet Audit 检查直接及传递依赖，警告会令构建失败。构建启用 .NET 静态分析器。xUnit、Visual Studio 测试适配器和 Microsoft.NET.Test.Sdk 只用于测试。
+## 标准命令
 
-## 运行 WPF
+在仓库根目录执行：
 
-~~~powershell
-dotnet run --project .\src\AGSwitcher.App\AGSwitcher.App.csproj -c Release --no-build
-~~~
+```powershell
+# 代码格式检查与静态分析（CI 标准）
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
 
-本机只使用仓库内 SDK 时，可用以下命令直接启动已构建版本。
+# 运行全部隔离合成单元测试（不触碰真实客户端与真实凭据）
+cargo test --locked
 
-~~~powershell
-.\.local\dotnet\dotnet.exe .\src\AGSwitcher.App\bin\Release\net10.0-windows\win-x64\AGSwitcher.App.dll
-~~~
+# 构建 Release 可执行文件并生成候选 ZIP 包
+cargo build --locked --release
+./scripts/package.ps1
+```
 
-## Windows 窗口验收
+## 测试安全说明
 
-在可用的交互式 Windows 桌面上运行窗口验收脚本。此脚本通过 Windows UI Automation 操作本项目的临时进程，需要先关闭同一 Windows 会话里的其他模拟窗口。GitHub CI 的单元与模拟测试无需桌面。
-
-~~~powershell
-powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\AGSwitcher.IntegrationTests\Smoke-Wpf.ps1 -Executable .\src\AGSwitcher.App\bin\Release\net10.0-windows\win-x64\AGSwitcher.App.exe
-~~~
-
-使用私有 SDK 时追加参数 -DotnetRoot .\.local\dotnet。上面命令的执行策略只用于该 PowerShell 进程。真实 Antigravity 测试需另行批准。
+默认 `cargo test --locked` 仅运行合成凭据（`ag-switch-lite-test:*` 独立命名空间，析构自动清理）、离屏测试窗口与子进程锁探针，不会读取或修改 `gemini:antigravity`，也不会关闭正在运行的 Antigravity。标记为 `#[ignore]` 的真机生命周期测试仅限在隔离测试账户且保存全部工作后由人工显式授权执行。

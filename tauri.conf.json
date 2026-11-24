@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AG Account Switcher Lite",
+  "version": "0.1.0",
+  "identifier": "org.ag-account-switcher.lite",
+  "build": { "frontendDist": "ui" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{
+      "label": "main",
+      "title": "AG Account Switcher Lite",
+      "width": 520,
+      "height": 550,
+      "minWidth": 420,
+      "minHeight": 500
+    }],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "copyright": "Copyright (c) 2026 AG Account Switcher Lite contributors; derived from agy-switch (CC BY-NC-SA 4.0, NonCommercial)",
+    "icon": ["icons/icon.ico"]
+  }
+}

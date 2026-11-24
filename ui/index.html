@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AG Account Switcher Lite</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" type="module"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1 id="title">Antigravity 账号</h1>
+        <p id="intro">点击已保存的账号，在原生 App 中打开。</p>
+      </div>
+      <span id="count" class="count" hidden></span>
+    </header>
+    <p id="notice" role="status" aria-live="polite"></p>
+    <ul id="accounts" aria-label="已保存的账号"></ul>
+    <form id="registration" hidden>
+      <label for="label" id="label-title">账号名称</label>
+      <div class="input-row">
+        <input id="label" autocomplete="off" maxlength="48" required>
+        <button type="submit" class="primary" id="save">保存</button>
+        <button type="button" id="cancel-registration">取消</button>
+      </div>
+    </form>
+    <footer>
+      <button id="register" type="button" class="primary">登记当前账号</button>
+      <button id="restore" type="button" hidden>恢复切换前会话</button>
+      <button id="forget" type="button" hidden>清除恢复记录</button>
+      <button id="reload" type="button" hidden>重试</button>
+    </footer>
+    <p id="guidance"></p>
+    <dialog id="confirm">
+      <form method="dialog">
+        <p id="confirm-text"></p>
+        <div class="input-row">
+          <button id="no" value="cancel">取消</button>
+          <button id="yes" value="confirm">确认</button>
+        </div>
+      </form>
+    </dialog>
+  </main>
+</body>
+</html>

@@ -1,15 +1,18 @@
-# 分层与状态机
+# 架构总览 (Architecture Overview)
 
-| 项目 | 职责 |
-| --- | --- |
-| AGSwitcher.App | WPF 视图、命令、可访问性标识和 ViewModel。App 在启动时组装依赖 |
-| AGSwitcher.Application | 确认、安全预检、切换事务、结果验证、恢复 |
-| AGSwitcher.Domain | 模拟候选目录、能力状态、切换状态与原因 |
-| AGSwitcher.Infrastructure | 模拟客户端、Windows Named Mutex、配置文件和 Windows 本地事件 |
-| AGSwitcher.UnitTests | 状态机单测与模拟后端测试 |
+## 模块分层
 
-典型流程为 `LOCKED → CONFIRMING → PRECHECK → SWITCHING → VERIFYING → COMPLETED → LOCKED`。错误确认留在确认界面。取消时清除数字并回到锁定。预检失败返回 `BLOCKED`。执行结果不明确时返回 `FAILED`，保持恢复锁直到显式重置并取得可信快照。
+AG Account Switcher Lite (`0.1.0`) 是面向 Windows 11 x64 的单可执行文件 Tauri 2 应用，由四个高内聚层组成：
 
-模拟数据驻留进程内。后端只有一个活动 ID。界面只在空闲时允许修改候选账号或场景，执行和核验期间拒绝重复请求及关闭窗口。Windows 终止进程时释放实例锁。
-
-当前唯一接入的后端为模拟客户端。真实兼容性参见 [官方能力矩阵](../research/official-compatibility.md)。
+1. **WebView2 表现层 (`ui/index.html`, `ui/app.js`, `ui/style.css`)**
+   - 原生 HTML/CSS/JS 实现，零第三方前端框架依赖，启用严格 CSP 且 `capabilities/main.json` 权限集为空（`permissions: []`）。
+   - 仅接收脱敏后的槽位编号（`1..=4`）、备注名称、当前活动槽位标识及恢复状态；当检测到客户端正在运行时弹出轻量切换确认对话框。
+2. **IPC 与互斥入口层 (`src/main.rs`, `src/switch_lock.rs`)**
+   - 注册 `tauri-plugin-single-instance` 保证同一会话内单窗口实例；
+   - 所有命令统一在 `with_vault` 阻塞池任务中持有 `SwitchLock`（`account-switch.lock`, `share_mode(0)`），保证进程内与跨进程串行互斥。
+3. **切换与恢复事务层 (`src/service.rs`)**
+   - 管理最多 4 个槽位登记、移除、切号、回读验证与失败自动回滚；
+   - 维护 `Journal` 恢复记录（`p1`/`p0` 挂起态与 `r1`/`r0` 就绪态），并在切出或执行会话恢复前通过 `same_account()`（比对 JWT `sub` 或 `refresh_token`）将官方后台自动刷新的最新凭据回写至对应槽位。
+4. **平台集成层 (`src/vault.rs`, `src/client.rs`, `src/client/graceful.rs`, `src/client/terminate.rs`)**
+   - `vault.rs`：封装 Win32 `CredReadW` / `CredWriteW` / `CredDeleteW`，原地替换凭据消除“先删后写”断档窗口，敏感内存使用 `Zeroizing` 并在身份提取析构时显式 `zeroize`。
+   - `client.rs`：核实同会话进程归属（排除 Node Sidecar 与无关第三方 IDE 的 `language_server.exe`），执行两阶段安全关闭（`WM_CLOSE` 可见窗口关闭门禁 + 后台托盘驻留进程收尾），清理失效 `DevToolsActivePort`，并按安全过滤规则重放启动标志与 Antigravity 亲和伴生进程。

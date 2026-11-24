@@ -7,28 +7,29 @@ permissions:
   contents: read
 
 env:
-  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
-  DOTNET_NOLOGO: '1'
+  CARGO_TERM_COLOR: always
 
 jobs:
   candidate:
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: actions/setup-dotnet@baa11fbfe1d6520db94683bd5c7a3818018e4309 # v5.1.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          global-json-file: global.json
-      - name: Restore, build and test
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting, lints, and unit tests
         run: |
-          dotnet restore AGSwitcher.sln --locked-mode --force-evaluate
+          cargo fmt --all -- --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          dotnet build AGSwitcher.sln -c Release --no-restore -p:ContinuousIntegrationBuild=true
+          cargo clippy --locked --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          dotnet test AGSwitcher.sln -c Release --no-build --no-restore
-      - name: Verify SBOM tool and package candidate
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify SBOM tool and package release candidate
         run: |
           $sbom = Join-Path $env:RUNNER_TEMP 'sbom-tool-win-x64.exe'
           $uri = 'https://github.com/microsoft/sbom-tool/releases/download/v4.1.5/sbom-tool-win-x64.exe'
@@ -37,15 +38,16 @@ jobs:
           if ((Get-FileHash -LiteralPath $sbom -Algorithm SHA256).Hash -ne $sha256) {
             throw 'Unexpected SBOM tool checksum.'
           }
-          ./scripts/package.ps1 -SbomTool $sbom
+          ./scripts/package.ps1 -CargoWrapper cargo -SbomTool $sbom
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-x64-release-candidate
           path: |
-            artifacts/*.zip
-            artifacts/*.sha256
-            artifacts/*.spdx.json
-            artifacts/*.sbom-validation.json
+            artifacts/ag-account-switcher-lite-*-win-x64.zip
+            artifacts/ag-account-switcher-lite-*-win-x64.zip.sha256
+            artifacts/ag-account-switcher-lite-*-win-x64.spdx.json
+            artifacts/ag-account-switcher-lite-*-win-x64.sbom-validation.json
             CHANGELOG.md
+            NOTICE.md
           if-no-files-found: error
           retention-days: 14

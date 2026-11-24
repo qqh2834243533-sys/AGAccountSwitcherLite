@@ -1,22 +1,48 @@
 # AG Account Switcher Lite
 
-[简体中文](README.md)
+[中文说明](README.md) · [Attribution & Notice (NOTICE)](NOTICE.md) · [Security Design](docs/security/design.md)
 
-An unofficial Windows 11 x64 desktop utility. Version 0.1.0 provides an offline WPF switch simulation and instructions for using the official Antigravity sign-in flow.
+**AG Account Switcher Lite (`ag-account-switcher-lite`)** is an unofficial manual four-account switcher for the Windows 11 x64 Antigravity desktop app, built with Rust and Tauri 2.
 
-- Start with four simulated accounts. Add and remove candidates for the current run.
-- Type a random four-digit confirmation before a simulated switch. The app allows one instance per Windows session and one transaction per instance.
-- Exercise busy and unknown Agent states, incompatible versions, authentication failures and restart failures. Reset the simulation to recover.
-- Follow the in-app guide to sign out and sign back in manually within the official client and browser.
+It has no built-in OAuth server, no bundled client secrets, no quota polling, no model API proxy, and no workspace or conversation database writes. Initial sign-in and re-authentication are always handled by the official Antigravity app and official browser flow.
 
-## Run locally
+## Key Capabilities
 
-Follow the [build instructions](docs/development/build.md). To run the extracted Windows x64 ZIP, install the [.NET 10 Desktop Runtime x64](https://dotnet.microsoft.com/download/dotnet/10.0) and open `AGSwitcher.App.exe`. The MVP UI is in Simplified Chinese.
+- **Four-Slot Windows Credential Vault**: Save up to 4 accounts signed in through the official Antigravity app. Credentials and rollback state stay inside the current Windows user's Credential Manager (`CRED_TYPE_GENERIC`), while the WebView2 UI receives only slot numbers and labels.
+- **Active Slot Detection & Refreshed Token Sync**: Highlights the currently active registered slot and automatically writes official background-refreshed tokens back to their matching slot before switching or restoring.
+- **Window-Safe Shutdown Gate (1-A)**:
+  - When Antigravity is closed: switches credentials and launches the app in a single click.
+  - When Antigravity is running: prompts for confirmation first, then sends `WM_CLOSE` to visible windows without opening tray menus or stealing mouse/keyboard focus.
+  - **Data-Loss Guard**: If any visible window remains open when the close timeout expires (for example, an unsaved-changes dialog), switching aborts safely without modifying credentials. Remaining verified tray-resident processes (checked by executable image path and process creation time) are terminated only after all visible windows have closed or hidden to the tray.
+- **External Plugin & Launch-Flag Compatibility**: Clears stale `%APPDATA%\Antigravity\DevToolsActivePort` files on exit, preserves safe startup flags such as `--remote-debugging-port`, proxy, and DPI options (stripping transient workspace paths and `antigravity://` deep links), and relaunches Antigravity-affiliated companion tools (such as `agy-claude-style-watcher`).
+- **Verified Rollback Journal**: Verifies every credential write via read-back and automatically restores the previous state if launching Antigravity fails, with manual session rollback available when the client is closed.
 
-![WPF simulation showing four accounts](assets/screenshot-simulation.png)
+## Usage
 
-Live automated switching and skipping browser authentication are unavailable. The app does not access credentials, model services or Antigravity data. The four-digit code guards against accidental clicks.
+1. Open the official Antigravity desktop app and sign in through its browser flow. Confirm the expected account in Antigravity.
+2. Open `ag-account-switcher-lite.exe`, click **Save current account**, and enter a label (up to 4 accounts).
+3. Make sure no agents are actively running and save your work before clicking a saved account. Verify the active identity inside Antigravity after it opens.
+4. If Google requests re-authentication, sign in using the official Antigravity flow. Remove and re-save a slot if its saved authorization has been revoked.
 
-See the [compatibility matrix](docs/research/official-compatibility.md), [feasibility report](docs/research/feasibility-report.md) and [security design](docs/security/design.md).
+## Building & Packaging on Windows
 
-This independent project is unaffiliated with and has no endorsement from Google.
+Requires Windows 11 x64, Rust Stable (`x86_64-pc-windows-msvc`), MSVC C++ Build Tools, a Windows SDK, and the WebView2 Runtime. See [Build Guide](docs/development/build.md).
+
+```powershell
+cargo test --locked
+cargo build --locked --release
+./scripts/package.ps1
+```
+
+## Scope & Limitations
+
+- **Shared Sign-In Surface**: This tool updates only the desktop app's `gemini:antigravity` Windows Credential Manager entry and does not rewrite `~/.gemini/antigravity-cli/antigravity-oauth-token` or `.vscdb`. Running `agy` CLI or Antigravity IDE processes block switching until closed.
+- **Unofficial Integration**: Google does not publish a third-party multi-account switching contract for the standalone Windows desktop app. Review [Compliance & Risk Assessment](docs/security/compliance-assessment.md) before use.
+
+## Source Attribution & License
+
+Derived from [anglee0323/agy-switch v4.10.18](https://github.com/anglee0323/agy-switch/releases/tag/v4.10.18) (commit `815714f9ef431233f663a3c9910071a683de7e5d`), which credits [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager).
+
+Licensed for **NonCommercial** use under **[CC BY-NC-SA 4.0](LICENSE)** (Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International). See [NOTICE.md](NOTICE.md) for the complete attribution chain and list of modifications. The earlier `.NET 10 WPF` offline simulation prototype is preserved on the `archive/dotnet-simulation-prototype` branch.
+
+This is an independent tool and is not affiliated with, authorized, or endorsed by Google LLC.

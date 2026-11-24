@@ -1,15 +1,11 @@
-# 安全设计
+# 安全设计 (Security Design)
 
-| 检查项 | 0.1.0 |
+| 安全域 | `0.1.0`（Rust + Tauri 2）实现机制 |
 | --- | --- |
-| 网络、模型、遥测 | 应用源码无网络请求、HTTP 服务或模型调用。开发阶段的 NuGet 还原访问公开包源 |
-| 凭据与诊断 | 模拟别名与确认数字驻留内存。诊断默认关闭，启用时仅通过 EventSource 发出状态与原因枚举 |
-| 命令与进程 | App 无命令执行、外部客户端启动和终止路径。登录指引只显示文字 |
-| 文件访问 | 应用仅主动读取自己的 JSON 设置，无 Antigravity 文件访问 |
-| 并发 | Windows 会话内命名 Mutex 与单事务状态机。其他 Windows 会话、浏览器及独立客户端不在互斥范围 |
-| 身份与恢复 | 执行前后核验状态，遇到未知或失败时停止。故障后重置并重新核对模拟状态 |
-| 卸载 | 关闭工具，删除解压目录和可选配置 |
-
-可选配置位于 `%LOCALAPPDATA%\AGAccountSwitcherLite\settings.json`。用户可手动保存 `{"EnableDiagnostics":true}` 并重启。解析仅允许已知字段，文件上限 4 KiB，缺省或无效时关闭诊断。工具无需管理员权限。
-
-正式发布前复查源码、锁定依赖、许可证、发行包 SBOM、哈希和签名。真实环境的会话安全验收需要 [单独批准](integration-approval.md)。
+| **网络、遥测与模型代理** | 应用源码无任何网络客户端、HTTP 回调服务器、额度查询、自动更新拉取或模型 API 代理。 |
+| **凭据存储与内存保护** | 槽位凭据（`ag-account-switcher-lite:v1:account:1..=4`）与恢复日志存放在当前 Windows 用户的 Credential Manager（`CRED_TYPE_GENERIC`）；`CredWriteW` 原地替换避免先删后写断档；原始字节装入 `Zeroizing<Vec<u8>>`，JWT `sub` 与 `refresh_token` 解析结构体在 `Drop` 时显式执行 `zeroize()` 清零。 |
+| **WebView2 与 IPC 隔离** | `tauri.conf.json` 配置严格 CSP（仅允许 `'self'` 与本地 IPC），`capabilities/main.json` 权限集为空（`permissions: []`）；后端仅向前端返回槽位序号、备注名与状态枚举，绝不传出 Token 原文。 |
+| **并发互斥** | `tauri-plugin-single-instance` 保证单窗口实例，`SwitchLock` 通过 `OpenOptionsExt::share_mode(0)` 独占锁定 `%LOCALAPPDATA%\org.ag-account-switcher.lite\account-switch.lock` 串行化全部凭据与切换事务。 |
+| **进程核实与窗口门禁** | 仅操作当前会话内经 `QueryFullProcessImageNameW` 与 `GetProcessTimes` 双重核实的进程；运行态切换先提示确认并向可见窗口投递 `WM_CLOSE`，若可见窗口超时未关（如未保存提示）立即中止不强杀；排除 Node Sidecar 与无关第三方 IDE 的同名 `language_server.exe`。 |
+| **启动参数与伴生进程** | `%LOCALAPPDATA%\org.ag-account-switcher.lite\launch-context.json` 通过临时文件重命名原子写入，落盘与读取双重剥离临时目录/文件位置参数、协议深链与代码注入标志；非父链伴生启动器须同时满足 `--exit-on-host-close` 与显式 Antigravity/AGY 亲和性校验。 |
+| **卸载与清理** | 删除便携版目录、`%LOCALAPPDATA%\org.ag-account-switcher.lite` 目录，并在 Windows 凭据管理器中移除 `ag-account-switcher-lite:v1:*` 条目即可完整清理，不影响官方客户端安装文件与项目数据。 |
