@@ -1,54 +1,48 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    env, fs,
+    fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows_sys::Win32::{
+    Storage::FileSystem::FILE_SHARE_READ, System::RemoteDesktop::ProcessIdToSessionId,
+};
 
 mod graceful;
+mod installation;
 mod terminate;
 
 use graceful::GracefulExit;
+pub use installation::installed;
 
 const LAUNCH_CONTEXT_FILE: &str = "launch-context.json";
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct LaunchPlan {
-    #[serde(default)]
-    pub app_args: Vec<String>,
-    #[serde(default)]
-    pub companion: Option<CompanionLauncher>,
+    app_args: Vec<String>,
+    companion: Option<ObservedCompanion>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CompanionLauncher {
-    pub executable: PathBuf,
+struct SavedLaunchContext {
     #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub working_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub spawns_app: bool,
-    #[serde(skip)]
-    pub observed_pid: Option<u32>,
-    #[serde(skip)]
-    pub observed_start_time: Option<u64>,
+    app_args: Vec<String>,
 }
 
-pub fn installed() -> Option<PathBuf> {
-    [
-        ("LOCALAPPDATA", r"Programs\antigravity\Antigravity.exe"),
-        ("ProgramFiles", r"Antigravity\Antigravity.exe"),
-    ]
-    .into_iter()
-    .filter_map(|(root, suffix)| env::var_os(root).map(|value| PathBuf::from(value).join(suffix)))
-    .find(|path| path.is_file())
+struct ObservedCompanion {
+    executable: PathBuf,
+    args: Vec<String>,
+    spawns_app: bool,
+    pid: u32,
+    start_time: u64,
+    // Keep the observed image open without write/delete sharing until relaunch.
+    _image: fs::File,
 }
 
 fn session(pid: u32) -> Option<u32> {
@@ -129,8 +123,8 @@ impl ProcessSnapshot {
     // failed observation cannot look like a clean exit.
     // Exclude Node.js plugin sidecar workers (`Antigravity.exe --import=.../sidecar_sdk/...`)
     // and unrelated third-party IDE `language_server.exe` processes.
-    fn writers(&self) -> impl Iterator<Item = &Process> {
-        self.system.processes().values().filter(|process| {
+    fn writers<'a>(&'a self, executable: Option<&'a Path>) -> impl Iterator<Item = &'a Process> {
+        self.system.processes().values().filter(move |process| {
             if !session(process.pid().as_u32()).is_none_or(|id| id == self.current_session) {
                 return false;
             }
@@ -140,6 +134,12 @@ impl ProcessSnapshot {
             }
             if name == "language_server.exe" {
                 return is_antigravity_language_server_path(process.exe())
+                    || process
+                        .exe()
+                        .zip(executable.and_then(Path::parent))
+                        .is_some_and(|(image, root)| {
+                            image.ancestors().any(|dir| same_image_path(dir, root))
+                        })
                     || self.has_antigravity_ancestor(process);
             }
             false
@@ -189,7 +189,7 @@ impl ProcessSnapshot {
         candidates.into_iter().next()
     }
 
-    fn detect_companion(&self, main_app: &Process, executable: &Path) -> Option<CompanionLauncher> {
+    fn detect_companion(&self, main_app: &Process, executable: &Path) -> Option<ObservedCompanion> {
         // Tier 1: walk up to 2 ancestor levels from the main Antigravity process
         // (e.g. a plugin shortcut running `watcher.exe --launch --exit-on-host-close`).
         let mut child = main_app;
@@ -211,21 +211,12 @@ impl ProcessSnapshot {
         // Tier 2: attach-mode companions in the same Windows session configured with
         // `--exit-on-host-close` AND explicit Antigravity / AGY plugin affinity
         // (such as `agy-claude-style-watcher`), selected deterministically.
-        let mut candidates: Vec<CompanionLauncher> = self
-            .system
+        self.system
             .processes()
             .values()
             .filter(|process| session(process.pid().as_u32()) == Some(self.current_session))
             .filter_map(|process| build_companion_from_process(process, executable, false))
-            .collect();
-
-        candidates.sort_by_key(|c| {
-            (
-                c.observed_start_time.unwrap_or(0),
-                c.observed_pid.unwrap_or(0),
-            )
-        });
-        candidates.pop()
+            .max_by_key(|companion| (companion.start_time, companion.pid))
     }
 
     fn capture_launch_plan(&self, executable: &Path, app_pids: &[u32]) -> Option<LaunchPlan> {
@@ -271,119 +262,69 @@ fn is_electron_child_args(args: &[String]) -> bool {
         })
 }
 
-fn is_safe_two_token_flag(lower: &str) -> bool {
+fn loopback_address(value: &str) -> bool {
     matches!(
-        lower,
-        "--remote-debugging-port"
-            | "--remote-debugging-address"
-            | "--proxy-server"
-            | "--proxy-bypass-list"
-            | "--proxy-pac-url"
-            | "--lang"
-            | "--locale"
-            | "--user-data-dir"
-            | "--extensions-dir"
-            | "--force-device-scale-factor"
-            | "--log-level"
-            | "--enable-features"
-            | "--disable-features"
-            | "--ozone-platform"
-            | "--password-store"
-            | "--use-gl"
-            | "--use-angle"
+        value.parse::<IpAddr>(),
+        Ok(IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST))
     )
 }
 
-fn is_dropped_two_token_flag(lower: &str) -> bool {
-    matches!(
-        lower,
-        "--install-extension"
-            | "--uninstall-extension"
-            | "--locate-shell-integration-path"
-            | "--inspect"
-            | "--inspect-brk"
-            | "--inspect-port"
-            | "--import"
-            | "--eval"
-            | "-e"
-            | "--crash-reporter-id"
-            | "--add"
-            | "--diff"
-            | "--merge"
-            | "--goto"
-            | "-g"
-            | "-a"
-            | "-d"
-            | "-m"
-    )
+fn valid_local_proxy(value: &str) -> bool {
+    let authority = match value.split_once("://") {
+        Some(("http" | "https" | "socks4" | "socks5", authority)) => authority,
+        Some(_) => return false,
+        None => value,
+    };
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
-fn is_dropped_single_flag(lower: &str) -> bool {
-    lower.starts_with("--squirrel-")
-        || lower.starts_with("--import=")
-        || lower.starts_with("--inspect=")
-        || lower.starts_with("--inspect-brk=")
-        || lower.starts_with("--inspect-port=")
-        || lower.starts_with("--eval=")
-        || lower.starts_with("--type=")
-        || lower.starts_with("--crash-reporter")
-        || matches!(
-            lower,
-            "--new-window"
-                | "-n"
-                | "--reuse-window"
-                | "-r"
-                | "--wait"
-                | "-w"
-                | "--version"
-                | "-v"
-                | "--help"
-                | "-h"
-                | "--status"
-                | "-s"
-                | "--list-extensions"
-                | "--show-versions"
-                | "--node-ipc"
-        )
+fn valid_relaunch_value(flag: &str, value: &str) -> bool {
+    match flag {
+        "--remote-debugging-port" => value.parse::<u16>().is_ok(),
+        "--remote-debugging-address" => loopback_address(value),
+        "--proxy-server" => valid_local_proxy(value),
+        "--lang" | "--locale" => {
+            (2..=35).contains(&value.len())
+                && value.as_bytes()[..2].iter().all(u8::is_ascii_alphabetic)
+                && value.split('-').all(|part| {
+                    !part.is_empty() && part.bytes().all(|ch| ch.is_ascii_alphanumeric())
+                })
+        }
+        "--force-device-scale-factor" => value
+            .parse::<f32>()
+            .is_ok_and(|scale| (0.5..=5.0).contains(&scale)),
+        _ => false,
+    }
 }
 
-/// Preserve safe `--*` startup flags (such as `--remote-debugging-port=0`, proxy, DPI,
-/// and GPU options) while stripping transient positional workspace/file paths,
-/// `antigravity://` deep links, Squirrel installer flags, and code-injection flags.
+/// Replay only documented launch options with validated values.
 fn filter_relaunch_app_args(args: &[String]) -> Vec<String> {
     let mut kept = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let lower = arg.to_ascii_lowercase();
-
-        if is_dropped_two_token_flag(&lower) {
-            index += 1;
-            if index < args.len() && !args[index].starts_with('-') {
-                index += 1;
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some((flag, value)) = arg.split_once('=') {
+            if valid_relaunch_value(flag, value) {
+                kept.push(arg.clone());
             }
-            continue;
-        }
-
-        if is_dropped_single_flag(&lower) {
-            index += 1;
-            continue;
-        }
-
-        if is_safe_two_token_flag(&lower) {
+        } else if matches!(
+            arg.as_str(),
+            "--disable-gpu" | "--disable-gpu-compositing" | "--disable-software-rasterizer"
+        ) {
             kept.push(arg.clone());
-            index += 1;
-            if index < args.len() && !args[index].starts_with('-') {
-                kept.push(args[index].clone());
-                index += 1;
-            }
-            continue;
-        }
-
-        if lower.starts_with("--") && lower.len() > 2 {
+        } else if args
+            .peek()
+            .is_some_and(|value| valid_relaunch_value(arg, value))
+        {
             kept.push(arg.clone());
+            kept.extend(args.next().cloned());
         }
-        index += 1;
     }
     kept
 }
@@ -427,7 +368,7 @@ fn has_antigravity_affinity(executable: &Path, args: &[String]) -> bool {
 fn evaluate_companion_candidate(
     executable: &Path,
     raw_args: &[String],
-    is_ancestor: bool,
+    verified_live_ancestor: bool,
 ) -> Option<(Vec<String>, bool)> {
     let file_name = executable
         .file_name()?
@@ -447,125 +388,124 @@ fn evaluate_companion_candidate(
     // ancestor plugin launcher (`--launch`) wrapping Antigravity.
     // For attach-mode processes outside the parent chain, require explicit Antigravity /
     // AGY plugin affinity so unrelated session processes are never captured.
-    if is_ancestor {
+    if verified_live_ancestor {
         if !has_exit_on_close && !spawns_app {
             return None;
         }
-    } else if !has_exit_on_close || !has_antigravity_affinity(executable, raw_args) {
+    } else if spawns_app || !has_exit_on_close || !has_antigravity_affinity(executable, raw_args) {
         return None;
     }
 
-    // Strip `--relaunch` so the companion won't force an extra kill/restart cycle.
-    let args = sanitize_companion_args(raw_args);
+    let args = ["--launch", "--exit-on-host-close"]
+        .into_iter()
+        .filter(|flag| raw_args.iter().any(|arg| arg.eq_ignore_ascii_case(flag)))
+        .map(str::to_owned)
+        .collect();
     Some((args, spawns_app))
 }
 
 fn build_companion_from_process(
     process: &Process,
     app_executable: &Path,
-    is_ancestor: bool,
-) -> Option<CompanionLauncher> {
+    verified_live_ancestor: bool,
+) -> Option<ObservedCompanion> {
     if process.pid().as_u32() == std::process::id() || has_path(process, app_executable) {
         return None;
     }
-    let exe = process.exe()?.to_path_buf();
-    if !exe.is_file() {
+    let executable = process.exe()?;
+    let raw_args = process_args(process);
+    let (args, spawns_app) =
+        evaluate_companion_candidate(executable, &raw_args, verified_live_ancestor)?;
+    let executable = fs::canonicalize(executable).ok()?;
+    if is_shell_or_self_name(
+        &executable
+            .file_name()?
+            .to_string_lossy()
+            .to_ascii_lowercase(),
+    ) {
         return None;
     }
-    let raw_args = process_args(process);
-    let (args, spawns_app) = evaluate_companion_candidate(&exe, &raw_args, is_ancestor)?;
-    let working_dir = process
-        .cwd()
-        .map(Path::to_path_buf)
-        .filter(|path| path.is_dir())
-        .or_else(|| exe.parent().map(Path::to_path_buf));
-
-    Some(CompanionLauncher {
-        executable: exe,
+    let image = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&executable)
+        .ok()?;
+    Some(ObservedCompanion {
+        executable,
         args,
-        working_dir,
         spawns_app,
-        observed_pid: Some(process.pid().as_u32()),
-        observed_start_time: Some(process.start_time()),
+        pid: process.pid().as_u32(),
+        start_time: process.start_time(),
+        _image: image,
     })
 }
 
-fn sanitize_companion_args(args: &[String]) -> Vec<String> {
-    args.iter()
-        .filter(|arg| !arg.eq_ignore_ascii_case("--relaunch"))
-        .cloned()
-        .collect()
-}
-
-fn sanitize_loaded_plan(plan: LaunchPlan) -> LaunchPlan {
-    let app_args = filter_relaunch_app_args(&plan.app_args);
-    let companion = plan.companion.and_then(|mut comp| {
-        let (cleaned_args, spawns_app) =
-            evaluate_companion_candidate(&comp.executable, &comp.args, comp.spawns_app)?;
-        comp.args = cleaned_args;
-        comp.spawns_app = spawns_app;
-        comp.observed_pid = None;
-        comp.observed_start_time = None;
-        Some(comp)
-    });
+fn load_launch_plan(data_root: &Path) -> LaunchPlan {
+    let path = data_root.join(LAUNCH_CONTEXT_FILE);
+    let Ok(raw) = fs::read(&path) else {
+        return LaunchPlan::default();
+    };
+    let app_args = serde_json::from_slice::<SavedLaunchContext>(&raw)
+        .map(|saved| filter_relaunch_app_args(&saved.app_args))
+        .unwrap_or_default();
+    // Rewrite old files once to remove legacy companion and rejected arguments.
+    save_launch_args(data_root, &app_args, Some(&raw));
     LaunchPlan {
         app_args,
-        companion,
+        companion: None,
     }
 }
 
-pub fn load_launch_plan(data_root: &Path) -> LaunchPlan {
-    let path = data_root.join(LAUNCH_CONTEXT_FILE);
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<LaunchPlan>(&content).ok())
-        .map(sanitize_loaded_plan)
-        .unwrap_or_default()
-}
-
-pub fn save_launch_plan(data_root: &Path, plan: &LaunchPlan) {
-    let sanitized = sanitize_loaded_plan(plan.clone());
-    let Ok(serialized) = serde_json::to_string_pretty(&sanitized) else {
+fn save_launch_args(data_root: &Path, args: &[String], previous: Option<&[u8]>) {
+    let saved = SavedLaunchContext {
+        app_args: filter_relaunch_app_args(args),
+    };
+    let Ok(serialized) = serde_json::to_vec_pretty(&saved) else {
         return;
     };
     let final_path = data_root.join(LAUNCH_CONTEXT_FILE);
-    let temp_path = data_root.join(format!("{LAUNCH_CONTEXT_FILE}.{}.tmp", std::process::id()));
-    if fs::write(&temp_path, &serialized).is_ok() && fs::rename(&temp_path, &final_path).is_err() {
-        let _ = fs::write(&final_path, &serialized);
-        let _ = fs::remove_file(&temp_path);
+    let current = previous
+        .map(std::borrow::Cow::Borrowed)
+        .or_else(|| fs::read(&final_path).ok().map(std::borrow::Cow::Owned));
+    if current.as_deref() != Some(serialized.as_slice()) {
+        let _ = crate::config_file::replace(&final_path, &serialized);
     }
 }
 
-pub fn observe_running_launch_plan(executable: &Path, data_root: &Path) {
+pub fn inspect_running(executable: Option<&Path>, data_root: &Path) -> bool {
     let Ok(snapshot) = ProcessSnapshot::read(
         ProcessRefreshKind::new()
             .with_exe(UpdateKind::Always)
-            .with_cmd(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always),
+            .with_cmd(UpdateKind::Always),
     ) else {
-        return;
+        return true;
     };
-    let app_pids: Vec<u32> = snapshot
-        .writers()
-        .filter(|process| has_path(process, executable))
-        .filter(|process| session(process.pid().as_u32()) == Some(snapshot.current_session))
-        .map(|process| process.pid().as_u32())
-        .collect();
-    if app_pids.is_empty() {
-        return;
+    let mut writers = snapshot.writers(executable).peekable();
+    let running = writers.peek().is_some();
+    if let Some(executable) = executable {
+        let app_pids: Vec<u32> = writers
+            .filter(|process| has_path(process, executable))
+            .filter(|process| session(process.pid().as_u32()) == Some(snapshot.current_session))
+            .map(|process| process.pid().as_u32())
+            .collect();
+        if let Some(app) = snapshot.main_app_process(executable, &app_pids) {
+            save_launch_args(data_root, &process_args(app), None);
+        }
     }
-    if let Some(plan) = snapshot.capture_launch_plan(executable, &app_pids) {
-        save_launch_plan(data_root, &plan);
-    }
+    running
 }
 
 pub fn require_closed() -> Result<(), &'static str> {
+    require_closed_for(installed().as_deref())
+}
+
+pub fn require_closed_for(executable: Option<&Path>) -> Result<(), &'static str> {
     if ProcessSnapshot::read(
         ProcessRefreshKind::new()
             .with_exe(UpdateKind::Always)
             .with_cmd(UpdateKind::Always),
     )?
-    .writers()
+    .writers(executable)
     .next()
     .is_some()
     {
@@ -574,22 +514,27 @@ pub fn require_closed() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn same_image_path(first: &Path, second: &Path) -> bool {
+    let first = first.to_string_lossy();
+    let second = second.to_string_lossy();
+    first
+        .trim_start_matches(r"\\?\")
+        .eq_ignore_ascii_case(second.trim_start_matches(r"\\?\"))
+}
+
 fn has_path(process: &Process, executable: &Path) -> bool {
-    process.exe().is_some_and(|path| {
-        path.as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&executable.as_os_str().to_string_lossy())
-    })
+    process
+        .exe()
+        .is_some_and(|path| same_image_path(path, executable))
 }
 
 pub fn prepare_switch(executable: &Path, data_root: &Path) -> Result<LaunchPlan, &'static str> {
     let snapshot = ProcessSnapshot::read(
         ProcessRefreshKind::new()
             .with_exe(UpdateKind::Always)
-            .with_cmd(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always),
+            .with_cmd(UpdateKind::Always),
     )?;
-    let writers: Vec<_> = snapshot.writers().collect();
+    let writers: Vec<_> = snapshot.writers(Some(executable)).collect();
     if writers.is_empty() {
         return Ok(load_launch_plan(data_root));
     }
@@ -612,21 +557,18 @@ pub fn prepare_switch(executable: &Path, data_root: &Path) -> Result<LaunchPlan,
         .map(|process| terminate::Target::open(process))
         .collect::<Result<_, _>>()?;
 
-    let mut plan = snapshot
+    let plan = snapshot
         .capture_launch_plan(executable, &app_pids)
         .unwrap_or_else(|| load_launch_plan(data_root));
-    save_launch_plan(data_root, &plan);
-    // Re-restore runtime observation IDs for `open()` after saving sanitized copy.
-    if let Some(live_plan) = snapshot.capture_launch_plan(executable, &app_pids) {
-        plan = live_plan;
-    }
+    save_launch_args(data_root, &plan.app_args, None);
 
     // Phase 1: silently close visible windows via WM_CLOSE so renderer state flushes
     // cleanly without touching the tray, mouse, or keyboard focus.
     // If any visible window refuses to close (e.g. unsaved dialog), this returns
     // `Err("close_timeout")` and never enters Phase 2.
+    let closed = || require_closed_for(Some(executable));
     let exit_state =
-        graceful::close_windows_gracefully(&app_pids, require_closed, Duration::from_millis(2500))?;
+        graceful::close_windows_gracefully(&app_pids, closed, Duration::from_millis(2500))?;
 
     // Phase 2: only if all visible windows closed/hid to tray (`HiddenToTray`) while
     // tray-resident processes remain, silently terminate the verified processes.
@@ -635,7 +577,7 @@ pub fn prepare_switch(executable: &Path, data_root: &Path) -> Result<LaunchPlan,
         terminate::remaining(&targets, deadline)?;
     }
     loop {
-        match require_closed() {
+        match closed() {
             Ok(()) => {
                 graceful::clear_stale_devtools_port();
                 // Give Windows / Electron a brief moment to release single-instance
@@ -666,25 +608,13 @@ fn matches_executable(system: &mut System, executable: &Path, current_session: u
     })
 }
 
-fn companion_is_still_running(companion: &CompanionLauncher, current_session: u32) -> bool {
+fn companion_is_still_running(companion: &ObservedCompanion, current_session: u32) -> bool {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         ProcessRefreshKind::new().with_exe(UpdateKind::Always),
     );
-    if let (Some(pid), Some(started)) = (companion.observed_pid, companion.observed_start_time) {
-        if let Some(process) = system.process(Pid::from_u32(pid)) {
-            if process.start_time() == started
-                && has_path(process, &companion.executable)
-                && session(pid) == Some(current_session)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-    // Loaded from disk (app was closed before switching): avoid spawning a duplicate
-    // if an instance of the same companion executable is already active in this session.
+    // Also avoid a duplicate if the observed companion restarted itself.
     system.processes().values().any(|process| {
         has_path(process, &companion.executable)
             && session(process.pid().as_u32()) == Some(current_session)
@@ -747,25 +677,11 @@ pub fn open(executable: &Path, plan: &LaunchPlan) -> Result<(), &'static str> {
     // If Antigravity was previously launched via a companion launcher (e.g. a plugin
     // shortcut with `--launch --exit-on-host-close`) and that launcher exited alongside
     // Antigravity, re-invoke the companion so both Antigravity and the plugin recover.
-    if let Some(companion) = plan.companion.as_ref().filter(|c| c.executable.is_file()) {
-        if evaluate_companion_candidate(
-            &companion.executable,
-            &companion.args,
-            companion.spawns_app,
-        )
-        .is_some()
-            && companion.spawns_app
-            && !companion_is_still_running(companion, current_session)
-        {
-            let companion_dir = companion
-                .working_dir
-                .as_deref()
-                .filter(|path| path.is_dir())
-                .or_else(|| companion.executable.parent())
-                .unwrap_or(directory);
-            let cleaned_args = sanitize_companion_args(&companion.args);
+    if let Some(companion) = &plan.companion {
+        if companion.spawns_app && !companion_is_still_running(companion, current_session) {
+            let companion_dir = companion.executable.parent().unwrap_or(directory);
             if let Ok(mut child) =
-                spawn_detached(&companion.executable, &cleaned_args, companion_dir)
+                spawn_detached(&companion.executable, &companion.args, companion_dir)
             {
                 if wait_for_app_running(
                     executable,
@@ -794,19 +710,10 @@ pub fn open(executable: &Path, plan: &LaunchPlan) -> Result<(), &'static str> {
     // If an attach-only companion (`--exit-on-host-close` without `--launch`, with
     // verified Antigravity/AGY affinity) exited with the old Antigravity process,
     // best-effort relaunch it now that the host is up.
-    if let Some(companion) = plan.companion.as_ref().filter(|c| c.executable.is_file()) {
-        if evaluate_companion_candidate(&companion.executable, &companion.args, false).is_some()
-            && !companion.spawns_app
-            && !companion_is_still_running(companion, current_session)
-        {
-            let companion_dir = companion
-                .working_dir
-                .as_deref()
-                .filter(|path| path.is_dir())
-                .or_else(|| companion.executable.parent())
-                .unwrap_or(directory);
-            let cleaned_args = sanitize_companion_args(&companion.args);
-            let _ = spawn_detached(&companion.executable, &cleaned_args, companion_dir);
+    if let Some(companion) = &plan.companion {
+        if !companion.spawns_app && !companion_is_still_running(companion, current_session) {
+            let companion_dir = companion.executable.parent().unwrap_or(directory);
+            let _ = spawn_detached(&companion.executable, &companion.args, companion_dir);
         }
     }
 
@@ -816,6 +723,7 @@ pub fn open(executable: &Path, plan: &LaunchPlan) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[test]
     fn filters_electron_child_processes_and_sanitizes_relaunch_app_args() {
@@ -858,6 +766,10 @@ mod tests {
             "--inspect=9229".into(),
             "--install-extension".into(),
             "some.ext".into(),
+            "--unknown-flag=test".into(),
+            "--remote-debugging-address=0.0.0.0".into(),
+            "--lang=absolute/path".into(),
+            "--proxy-server=http://proxy.example.test:8080".into(),
         ]);
         assert_eq!(
             filtered,
@@ -949,52 +861,39 @@ mod tests {
     }
 
     #[test]
-    fn persists_and_sanitizes_launch_plan_atomically() {
+    fn migrates_launch_context_and_keeps_unchanged_file() {
         let dir = tempfile::tempdir().unwrap();
-        let plan = LaunchPlan {
-            app_args: vec![
-                "--remote-debugging-port=0".into(),
-                r"C:\Temp\ShouldBeStripped".into(),
-            ],
-            companion: Some(CompanionLauncher {
-                executable: PathBuf::from(
-                    r"C:\Users\Alice\AppData\Local\agy-claude-style\watcher.exe",
-                ),
-                args: vec![
-                    "--launch".into(),
-                    "--relaunch".into(),
-                    "--exit-on-host-close".into(),
-                ],
-                working_dir: Some(PathBuf::from(r"C:\Tools")),
-                spawns_app: true,
-                observed_pid: Some(12345),
-                observed_start_time: Some(999_999),
-            }),
-        };
-        save_launch_plan(dir.path(), &plan);
-        let reloaded = load_launch_plan(dir.path());
-        assert_eq!(reloaded.app_args, vec!["--remote-debugging-port=0"]);
-        let companion = reloaded.companion.expect("companion preserved");
-        assert_eq!(
-            companion.args,
-            vec!["--launch".to_string(), "--exit-on-host-close".to_string()]
-        );
-        assert_eq!(companion.observed_pid, None);
-        assert_eq!(companion.observed_start_time, None);
-
-        // Tampered launch-context.json with an unrelated attach-only binary is rejected on load.
-        let tampered = serde_json::json!({
-            "appArgs": ["C:\\SomeFolder", "--disable-gpu"],
+        let context = dir.path().join(LAUNCH_CONTEXT_FILE);
+        let legacy = serde_json::json!({
+            "appArgs": ["--lang=zh-CN", "--unknown-flag"],
             "companion": {
-                "executable": "C:\\Evil\\unrelated.exe",
-                "args": ["--exit-on-host-close"],
-                "spawnsApp": false
+                "executable": r"C:\Fixtures\agy-claude-style-watcher.exe",
+                "args": ["--launch"],
+                "spawnsApp": true
             }
         });
-        fs::write(dir.path().join(LAUNCH_CONTEXT_FILE), tampered.to_string()).unwrap();
-        let sanitized = load_launch_plan(dir.path());
-        assert_eq!(sanitized.app_args, vec!["--disable-gpu"]);
-        assert_eq!(sanitized.companion, None);
+        fs::write(&context, legacy.to_string()).unwrap();
+
+        let plan = load_launch_plan(dir.path());
+        assert!(plan.companion.is_none());
+        assert_eq!(plan.app_args, vec!["--lang=zh-CN"]);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&context).unwrap()).unwrap(),
+            serde_json::json!({ "appArgs": ["--lang=zh-CN"] }),
+        );
+
+        let marker = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&context)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(marker))
+            .unwrap();
+        save_launch_args(dir.path(), &plan.app_args, None);
+        assert_eq!(fs::metadata(&context).unwrap().modified().unwrap(), marker);
+        save_launch_args(dir.path(), &["--disable-gpu".to_owned()], None);
+        assert_ne!(fs::metadata(&context).unwrap().modified().unwrap(), marker);
+        assert_eq!(load_launch_plan(dir.path()).app_args, vec!["--disable-gpu"]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "ag-account-switcher-lite"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "CC-BY-NC-SA-4.0"
 description = "Manual account switching for the Windows Antigravity desktop app"
@@ -17,8 +17,10 @@ tauri = { version = "=2.12.5", features = ["tray-icon"] }
 tauri-plugin-single-instance = "=2.4.0"
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Graphics_Dwm",
   "Win32_Security_Credentials",
+  "Win32_Storage_FileSystem",
   "Win32_System_Registry",
   "Win32_System_RemoteDesktop",
   "Win32_System_Threading",

@@ -7,7 +7,7 @@
 不会抢占鼠标或打开系统托盘菜单。若 Antigravity 正在运行，点击账号会先弹出轻量确认提示，随后静默向可见窗口发送 `WM_CLOSE`；若存在未保存更改对话框导致窗口未关闭，工具会在超时后安全中止切换且不修改凭据；只有当所有可见窗口正常关闭或退入后台托盘后，才会收尾后台驻留进程并重开客户端。
 
 ### 使用 `agy-claude-style` 等外部插件时切换账号会掉线吗？
-工具在关闭旧进程后会清理失效的 `%APPDATA%\Antigravity\DevToolsActivePort`，重开时保留 `--remote-debugging-port` 等合法启动标志，并按亲和性规则自动重拉起随宿主退出的伴生启动器（同时支持常驻 `--watch` 模式自动重连）。
+工具关闭旧进程后会清理失效的 `%APPDATA%\Antigravity\DevToolsActivePort`。重开时只重放通过校验的主程序参数。运行态换号可恢复本次观察到的伴生程序，冷启动直接打开官方客户端。常驻插件可自行重新连接。
 
 ### 会同步修改 `agy` CLI 的登录账号吗？
 不会。本工具仅操作桌面端使用的 `gemini:antigravity` Windows 凭据条目，不改写 `~/.gemini/antigravity-cli/antigravity-oauth-token` 或 `.vscdb` 数据库。当检测到 `agy.exe` 或 Antigravity IDE 正在运行时，工具会暂停切换以防止并发写入冲突。

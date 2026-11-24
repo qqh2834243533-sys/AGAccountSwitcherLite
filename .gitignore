@@ -21,3 +21,4 @@
 .local/
 artifacts/
 settings.local.json
+AGENTS.local.md

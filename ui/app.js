@@ -1,4 +1,4 @@
-const chinese = navigator.language.toLowerCase().startsWith("zh");
+let chinese = navigator.language.toLowerCase().startsWith("zh");
 const strings = {
   title: ["AG Switcher", "AG Switcher"],
   accountsAria: ["Antigravity 账号", "Antigravity accounts"],
@@ -155,6 +155,7 @@ const strings = {
   journal_invalid: ["无法读取恢复记录。切换已停止。", "The recovery record could not be read. Switching stopped."],
   switch_in_progress: ["另一个账号操作尚未完成。", "An account operation is already in progress."],
   vault_unavailable: ["无法访问当前用户的 Windows 凭据管理器。", "Windows Credential Manager is unavailable."],
+  credential_too_large: ["登录凭据超过 Windows 凭据管理器的 2,560 字节上限。", "The sign-in credential exceeds the Windows Credential Manager limit of 2,560 bytes."],
   data_folder_unavailable: ["无法访问本工具的本地目录。", "The app’s local folder is unavailable."],
   lock_unavailable: ["无法锁定切换操作。", "Could not lock the account operation."],
   operation_failed: ["操作没有完成。请重试。", "The operation did not complete. Try again."],
@@ -173,9 +174,16 @@ const t = key => (strings[key] ?? strings.operation_failed)[chinese ? 0 : 1];
 const byId = id => document.getElementById(id);
 const api = window.__TAURI__?.core;
 const darkMedia = window.matchMedia("(prefers-color-scheme: dark)");
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 let current;
 let working = false;
+let switchPending = false;
+let confirmationPending = false;
+let preferencesPending = false;
+let preferencesRevision = 0;
+let overviewSequence = 0;
+let appliedOverview = 0;
 let registration = false;
 let recording = false;
 let recordingPreview = "";
@@ -188,49 +196,51 @@ const uiPrefs = {
   particlesFollow: true,
 };
 
-document.documentElement.lang = chinese ? "zh-CN" : "en";
-for (const [id, key] of Object.entries({
-  title: "title",
-  "settings-title": "settingsTitle",
-  "settings-close": "done",
-  "style-label": "styleLabel",
-  "mode-list": "modeList",
-  "mode-matrix": "modeMatrix",
-  "appearance-label": "appearanceLabel",
-  "theme-system": "themeSystem",
-  "theme-light": "themeLight",
-  "theme-dark": "themeDark",
-  "particles-label": "particlesLabel",
-  "particles-hint": "particlesHint",
-  "autostart-label": "autostartLabel",
-  "hotkey-title": "hotkeyTitle",
-  "footer-hint": "footerHint",
-  register: "registerShort",
-  restore: "restore",
-  forget: "forget",
-  "restore-footer": "restoreShort",
-  "forget-footer": "forgetShort",
-  reload: "reload",
-  save: "save",
-  "cancel-registration": "cancel",
-  "confirm-title": "confirmTitle",
-  no: "cancel",
-  yes: "yes",
-})) {
-  byId(id).textContent = t(key);
+function localize() {
+  document.documentElement.lang = chinese ? "zh-CN" : "en";
+  for (const [id, key] of Object.entries({
+    title: "title",
+    "settings-title": "settingsTitle",
+    "settings-close": "done",
+    "style-label": "styleLabel",
+    "mode-list": "modeList",
+    "mode-matrix": "modeMatrix",
+    "appearance-label": "appearanceLabel",
+    "theme-system": "themeSystem",
+    "theme-light": "themeLight",
+    "theme-dark": "themeDark",
+    "particles-label": "particlesLabel",
+    "particles-hint": "particlesHint",
+    "autostart-label": "autostartLabel",
+    "hotkey-title": "hotkeyTitle",
+    "footer-hint": "footerHint",
+    register: "registerShort",
+    restore: "restore",
+    forget: "forget",
+    "restore-footer": "restoreShort",
+    "forget-footer": "forgetShort",
+    reload: "reload",
+    save: "save",
+    "cancel-registration": "cancel",
+    "confirm-title": "confirmTitle",
+    no: "cancel",
+    yes: "yes",
+  })) {
+    byId(id).textContent = t(key);
+  }
+  byId("accounts").setAttribute("aria-label", t("accountsAria"));
+  byId("theme-toggle").setAttribute("aria-label", t("themeToggleAria"));
+  byId("theme-toggle").title = t("themeToggleAria");
+  byId("settings-toggle").setAttribute("aria-label", t("settingsAria"));
+  byId("settings-toggle").title = t("settingsAria");
+  byId("win-minimize").setAttribute("aria-label", t("minimizeAria"));
+  byId("win-minimize").title = t("minimizeAria");
+  byId("win-close").setAttribute("aria-label", t("closeAria"));
+  byId("win-close").title = t("closeAria");
+  byId("drag-zone").title = t("dragHint");
+  byId("label").placeholder = t("alias");
+  byId("label").setAttribute("aria-label", t("alias"));
 }
-byId("accounts").setAttribute("aria-label", t("accountsAria"));
-byId("theme-toggle").setAttribute("aria-label", t("themeToggleAria"));
-byId("theme-toggle").title = t("themeToggleAria");
-byId("settings-toggle").setAttribute("aria-label", t("settingsAria"));
-byId("settings-toggle").title = t("settingsAria");
-byId("win-minimize").setAttribute("aria-label", t("minimizeAria"));
-byId("win-minimize").title = t("minimizeAria");
-byId("win-close").setAttribute("aria-label", t("closeAria"));
-byId("win-close").title = t("closeAria");
-byId("drag-zone").title = t("dragHint");
-byId("label").placeholder = t("alias");
-byId("label").setAttribute("aria-label", t("alias"));
 
 function effectiveTheme() {
   if (uiPrefs.theme === "light" || uiPrefs.theme === "dark") return uiPrefs.theme;
@@ -357,11 +367,17 @@ function rebuildParticleGrid(w, h) {
 }
 
 let rafId = 0;
+let lastFrameTime = null;
 function renderStarburstFrame(now) {
+  rafId = 0;
   if (uiPrefs.layout !== "matrix" || document.hidden) {
-    rafId = 0;
+    lastFrameTime = null;
     return;
   }
+  const animate = !reducedMotion.matches;
+  const dt = lastFrameTime === null ? 1 / 60 : Math.min(0.05, (now - lastFrameTime) / 1000);
+  lastFrameTime = animate ? now : null;
+  if (!animate) now = 0;
 
   const rect = canvas.getBoundingClientRect();
   const w = rect.width || window.innerWidth || 504;
@@ -382,15 +398,17 @@ function renderStarburstFrame(now) {
   ctx.clearRect(0, 0, w, h);
 
   const wantHover = uiPrefs.particlesFollow && pointer.inside ? 1 : 0;
-  pointer.hoverMix += (wantHover - pointer.hoverMix) * 0.055;
+  const hoverStep = 1 - Math.pow(1 - 0.055, dt * 60);
+  pointer.hoverMix = animate ? lerp(pointer.hoverMix, wantHover, hoverStep) : 0;
   const m = pointer.hoverMix;
 
   const prevX = pointer.x;
   const prevY = pointer.y;
-  pointer.x += (pointer.tx - pointer.x) * 0.075;
-  pointer.y += (pointer.ty - pointer.y) * 0.075;
-  pointer.vx = pointer.x - prevX;
-  pointer.vy = pointer.y - prevY;
+  const pointerStep = 1 - Math.pow(1 - 0.075, dt * 60);
+  pointer.x = animate ? lerp(pointer.x, pointer.tx, pointerStep) : pointer.tx;
+  pointer.y = animate ? lerp(pointer.y, pointer.ty, pointerStep) : pointer.ty;
+  pointer.vx = animate && dt > 0 ? (pointer.x - prevX) / (dt * 60) : 0;
+  pointer.vy = animate && dt > 0 ? (pointer.y - prevY) / (dt * 60) : 0;
 
   const isDark = effectiveTheme() === "dark";
   const lut = isDark ? lutDark : lutLight;
@@ -466,11 +484,15 @@ function renderStarburstFrame(now) {
   }
 
   ctx.restore();
-  rafId = requestAnimationFrame(renderStarburstFrame);
+  if (animate) rafId = requestAnimationFrame(renderStarburstFrame);
 }
 
 function ensureStarburstLoop() {
-  if (uiPrefs.layout === "matrix" && !document.hidden && !rafId) {
+  if (uiPrefs.layout !== "matrix" || document.hidden) {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = 0;
+    lastFrameTime = null;
+  } else if (!rafId) {
     rafId = requestAnimationFrame(renderStarburstFrame);
   }
 }
@@ -536,11 +558,11 @@ function renderNoticeAndStatus() {
 
   byId("restore").hidden = !needsPendingRecoveryBtns || !current?.canRestore;
   byId("forget").hidden = !needsPendingRecoveryBtns || !current?.recovery;
-  byId("restore").disabled = working || recording;
-  byId("forget").disabled = working || recording;
+  byId("restore").disabled = working || switchPending || recording;
+  byId("forget").disabled = working || switchPending || recording;
 
   byId("reload").hidden = !showReload;
-  byId("reload").disabled = working || recording;
+  byId("reload").disabled = working || switchPending || recording;
 }
 
 function firstAvailableSlot(accounts) {
@@ -576,7 +598,7 @@ function formatModifiers(event) {
 }
 
 function openRegistration() {
-  if (working || recording || !current?.appInstalled || current?.recovery === "pending") return;
+  if (working || switchPending || recording || !current?.appInstalled || current?.recovery === "pending") return;
   const freeSlot = firstAvailableSlot(current?.accounts ?? []);
   if (!freeSlot) return;
   settingsOpen = false;
@@ -586,32 +608,39 @@ function openRegistration() {
 }
 
 async function requestSwitch(slot) {
-  if (working || recording) return;
+  if (working || recording || switchPending || confirmationPending) return;
+  switchPending = true;
   settingsOpen = false;
+  render();
   try {
     await load();
     render();
-  } catch (error) {
-    setNotice(typeof error === "string" ? error : "operation_failed", "error");
-    return;
-  }
-  if (!current?.appInstalled) {
-    setNotice("app_missing", "error");
-    return;
-  }
-  if (current.recovery === "pending") {
-    setNotice(current.canRestore ? "recovery_required" : "recovery_unmatched", "error");
-    return;
-  }
-  if (current.clientRunning) {
-    const promptKey = current.activeSlot === slot ? "reopenSameRunningPrompt" : "switchRunningPrompt";
-    if (!(await confirmAction(promptKey))) {
-      transientNotice = null;
-      renderNoticeAndStatus();
+    if (!current?.appInstalled) {
+      setNotice("app_missing", "error");
       return;
     }
+    if (current.recovery === "pending") {
+      setNotice(current.canRestore ? "recovery_required" : "recovery_unmatched", "error");
+      return;
+    }
+    if (!current.accounts.some(account => account.slot === slot)) {
+      setNotice("account_missing", "error");
+      return;
+    }
+    if (current.clientRunning) {
+      const promptKey = current.activeSlot === slot ? "reopenSameRunningPrompt" : "switchRunningPrompt";
+      if (!(await confirmAction(promptKey))) {
+        transientNotice = null;
+        return;
+      }
+    }
+    await operate("switch_account", { slot }, "opened");
+  } catch (error) {
+    setNotice(typeof error === "string" ? error : "operation_failed", "error");
+  } finally {
+    switchPending = false;
+    render();
   }
-  await operate("switch_account", { slot }, "opened");
 }
 
 function createAuxActions(slot, label, needsRecovery) {
@@ -624,7 +653,7 @@ function createAuxActions(slot, label, needsRecovery) {
     upd.className = "aux-btn aux-update";
     upd.textContent = t("updateCredential");
     upd.setAttribute("aria-label", `${t("updateCredential")} ${label}`);
-    upd.disabled = working || recording;
+    upd.disabled = working || switchPending || recording;
     upd.addEventListener("click", async event => {
       event.stopPropagation();
       if (await confirmAction("updateCredentialPrompt", label)) {
@@ -653,7 +682,7 @@ function createAuxActions(slot, label, needsRecovery) {
   rem.append(closeSvg);
   rem.title = `${t("remove")} ${label}`;
   rem.setAttribute("aria-label", `${t("remove")} ${label}`);
-  rem.disabled = working || recording || needsRecovery;
+  rem.disabled = working || switchPending || recording || needsRecovery;
   rem.addEventListener("click", async event => {
     event.stopPropagation();
     if (await confirmAction("removePrompt", label)) {
@@ -683,7 +712,7 @@ function renderSlots() {
       const isActive = current?.activeSlot === slot;
       btn.className = isActive ? "slot-trigger is-active" : "slot-trigger";
       if (isActive) btn.setAttribute("aria-current", "true");
-      btn.disabled = working || recording || needsRecovery || !current?.appInstalled;
+      btn.disabled = working || switchPending || recording || needsRecovery || !current?.appInstalled;
       btn.addEventListener("click", () => void requestSwitch(slot));
 
       if (isMatrix) {
@@ -751,7 +780,7 @@ function renderSlots() {
       li.append(btn, createAuxActions(slot, saved.label, needsRecovery));
     } else {
       btn.className = "slot-trigger is-empty";
-      btn.disabled = working || recording || needsRecovery || !current?.appInstalled;
+      btn.disabled = working || switchPending || recording || needsRecovery || !current?.appInstalled;
       btn.addEventListener("click", openRegistration);
 
       const unregHint = Boolean(current?.unregisteredActive);
@@ -830,13 +859,15 @@ function render() {
   const partSwitch = byId("particles-switch");
   partSwitch.dataset.on = String(uiPrefs.particlesFollow);
   partSwitch.setAttribute("aria-checked", String(uiPrefs.particlesFollow));
-  partSwitch.disabled = working;
+  for (const id of ["theme-toggle", "mode-list", "mode-matrix", "theme-system", "theme-light", "theme-dark", "particles-switch"]) {
+    byId(id).disabled = working || switchPending || preferencesPending;
+  }
 
   const autoSwitch = byId("autostart-switch");
   const autoOn = Boolean(current?.autostart);
   autoSwitch.dataset.on = String(autoOn);
   autoSwitch.setAttribute("aria-checked", String(autoOn));
-  autoSwitch.disabled = working || recording || !current;
+  autoSwitch.disabled = working || switchPending || recording || !current;
 
   // Registration bar
   byId("registration").hidden = !registration;
@@ -850,13 +881,13 @@ function render() {
   // Footer controls
   const showQuickReg = !registration && Boolean(current?.unregisteredActive) && Boolean(freeSlot) && Boolean(current?.appInstalled) && !needsRecovery;
   byId("register").hidden = !showQuickReg;
-  byId("register").disabled = working || recording;
+  byId("register").disabled = working || switchPending || recording;
 
   const readyRecovery = Boolean(current?.recovery) && !needsRecovery;
   byId("restore-footer").hidden = !readyRecovery || !current?.canRestore;
   byId("forget-footer").hidden = !readyRecovery;
-  byId("restore-footer").disabled = working || recording;
-  byId("forget-footer").disabled = working || recording;
+  byId("restore-footer").disabled = working || switchPending || recording;
+  byId("forget-footer").disabled = working || switchPending || recording;
 
   // Hotkey display & buttons
   const hotkeyPill = byId("hotkey-pill");
@@ -870,33 +901,43 @@ function render() {
   hotkeyPill.classList.toggle("is-recording", recording);
   hotkeyPill.classList.toggle("is-conflict", !recording && isConflict);
   hotkeyPill.classList.toggle("is-muted", !recording && !hasHotkey);
-  hotkeyPill.disabled = working || !current;
+  hotkeyPill.disabled = working || switchPending || !current;
 
   const editBtn = byId("hotkey-edit");
   const clearBtn = byId("hotkey-clear");
   editBtn.textContent = t("editHotkey");
   editBtn.hidden = recording;
-  editBtn.disabled = working || !current;
+  editBtn.disabled = working || switchPending || !current;
 
   clearBtn.textContent = recording ? t("cancel") : t("disableHotkey");
   clearBtn.hidden = !recording && !hasHotkey;
-  clearBtn.disabled = working || !current;
+  clearBtn.disabled = working || switchPending || !current;
 
   renderNoticeAndStatus();
 }
 
-function confirmAction(key, accountLabel = "") {
+async function confirmAction(key, accountLabel = "") {
   const dialog = byId("confirm");
-  byId("confirm-text").textContent = t(key).replace("{account}", () => accountLabel);
-  dialog.returnValue = "cancel";
-  dialog.showModal();
-  return new Promise(resolve => {
-    dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true });
-  });
+  if (confirmationPending || dialog.open) return false;
+  confirmationPending = true;
+  try {
+    byId("confirm-text").textContent = t(key).replace("{account}", () => accountLabel);
+    dialog.returnValue = "cancel";
+    dialog.showModal();
+    return await new Promise(resolve => {
+      dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true });
+    });
+  } finally {
+    confirmationPending = false;
+  }
 }
 
-function applyShellStatus(shell) {
+function applyShellStatus(shell, applyPreferences = !preferencesPending) {
   if (!shell) return;
+  if (typeof shell.chinese === "boolean" && shell.chinese !== chinese) {
+    chinese = shell.chinese;
+    localize();
+  }
   if (current) {
     current.autostart = shell.autostart;
     current.autostartBlocked = shell.autostartBlocked;
@@ -906,6 +947,7 @@ function applyShellStatus(shell) {
     current.theme = shell.theme;
     current.particlesFollow = shell.particlesFollow;
   }
+  if (!applyPreferences) return;
   if (shell.layout === "list" || shell.layout === "matrix") {
     uiPrefs.layout = shell.layout;
   }
@@ -918,32 +960,43 @@ function applyShellStatus(shell) {
 }
 
 async function load() {
-  current = await api.invoke("overview");
-  applyShellStatus(current);
+  const sequence = ++overviewSequence;
+  const revision = preferencesRevision;
+  const applyPreferences = !preferencesPending;
+  const overview = await api.invoke("overview");
+  if (sequence < appliedOverview) return;
+  appliedOverview = sequence;
+  current = overview;
+  applyShellStatus(overview, applyPreferences && !preferencesPending && revision === preferencesRevision);
 }
 
 async function persistPreferences(patch) {
+  if (working || switchPending || preferencesPending) return;
+  if (!api) {
+    Object.assign(uiPrefs, patch);
+    render();
+    return;
+  }
+
   const prev = { ...uiPrefs };
+  preferencesPending = true;
+  preferencesRevision++;
   Object.assign(uiPrefs, patch);
   render();
-  if (!api) return;
   try {
-    const shell = await api.invoke("set_preferences", {
-      layout: uiPrefs.layout,
-      theme: uiPrefs.theme,
-      particlesFollow: uiPrefs.particlesFollow,
-    });
-    applyShellStatus(shell);
-    render();
+    const shell = await api.invoke("set_preferences", { ...uiPrefs });
+    applyShellStatus(shell, true);
   } catch (error) {
     Object.assign(uiPrefs, prev);
     setNotice(typeof error === "string" ? error : "operation_failed", "error");
+  } finally {
+    preferencesPending = false;
     render();
   }
 }
 
 async function operate(command, arguments_, successKey) {
-  if (working) return;
+  if (working || (switchPending && command !== "switch_account")) return;
   working = true;
   setNotice("busy", "info");
   render();
@@ -973,7 +1026,7 @@ async function operate(command, arguments_, successKey) {
 }
 
 async function startRecording() {
-  if (working || recording || !current) return;
+  if (working || switchPending || recording || !current) return;
   recording = true;
   recordingPreview = "";
   setNotice("recordingPrompt", "info");
@@ -1021,6 +1074,7 @@ async function initialize() {
   setNotice("loading", "info");
   render();
   try {
+    applyShellStatus(await api.invoke("shell_status"));
     await load();
     transientNotice = null;
   } catch (error) {
@@ -1032,6 +1086,8 @@ async function initialize() {
 }
 
 /* --- Event Wiring --- */
+localize();
+reducedMotion.addEventListener("change", ensureStarburstLoop);
 darkMedia.addEventListener("change", () => {
   if (uiPrefs.theme === "system") syncDocumentRootAttributes();
 });
@@ -1060,7 +1116,7 @@ window.addEventListener("resize", () => {
   ensureStarburstLoop();
 });
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) ensureStarburstLoop();
+  ensureStarburstLoop();
 });
 
 byId("topbar").addEventListener("mousedown", event => {
@@ -1112,7 +1168,7 @@ byId("particles-switch").addEventListener("click", () => {
 });
 
 byId("autostart-switch").addEventListener("click", async () => {
-  if (working || recording || !current) return;
+  if (working || switchPending || recording || !current) return;
   const enabled = !current.autostart;
   working = true;
   render();
@@ -1171,7 +1227,7 @@ window.addEventListener("blur", () => {
 
 window.addEventListener("focus", async () => {
   ensureStarburstLoop();
-  if (working || registration || recording || byId("confirm").open) return;
+  if (working || switchPending || registration || recording || confirmationPending) return;
   try {
     await load();
     render();
@@ -1199,7 +1255,7 @@ document.addEventListener("keydown", event => {
     return;
   }
 
-  if (working || byId("confirm").open) return;
+  if (working || switchPending || confirmationPending) return;
 
   if (event.key === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
     if (registration) {
@@ -1227,6 +1283,7 @@ document.addEventListener("keydown", event => {
   if (activeTag === "INPUT" || activeTag === "TEXTAREA") return;
 
   if (!event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey && /^[1-4]$/.test(event.key)) {
+    if (event.repeat) return;
     const slot = Number(event.key);
     if (current?.accounts?.some(item => item.slot === slot)) {
       event.preventDefault();

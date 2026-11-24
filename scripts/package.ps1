@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$CargoWrapper,
+    [string]$CargoWrapper = 'cargo',
     [string]$SbomTool,
     [switch]$NoBuild,
     [switch]$Offline
@@ -28,18 +28,42 @@ if ($cargoVersion -ne $version -or $tauriVersion -ne $version) {
     throw "Version mismatch detected: VERSION=$version, Cargo.toml=$cargoVersion, tauri.conf.json=$tauriVersion"
 }
 
-if (-not $CargoWrapper) {
-    $CargoWrapper = 'cargo'
-}
+$userCargoHome = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.cargo' }
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { $userCargoHome }
+$pathRemaps = [ordered]@{}
+$pathRemaps[$root] = '/agasl/source'
+if ($cargoHome) { $pathRemaps[$cargoHome] = '/agasl/cargo' }
+if ($env:RUSTUP_HOME) { $pathRemaps[$env:RUSTUP_HOME] = '/agasl/rustup' }
 
 if (-not $NoBuild) {
     $buildArgs = @('build', '--locked', '--release', '--manifest-path', (Join-Path $root 'Cargo.toml'))
     if ($Offline) {
         $buildArgs += '--offline'
     }
-    & $CargoWrapper @buildArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Release build failed ($LASTEXITCODE)"
+    $previousFlags = $env:CARGO_ENCODED_RUSTFLAGS
+    $separator = [string][char]31
+    $rustFlags = @()
+    if ($previousFlags) {
+        $rustFlags += $previousFlags -split $separator
+    } elseif ($env:RUSTFLAGS) {
+        $rustFlags += $env:RUSTFLAGS -split '\s+' | Where-Object { $_ }
+    }
+    foreach ($entry in $pathRemaps.GetEnumerator()) {
+        $prefixes = @($entry.Key, $entry.Key.Replace('\', '/'))
+        if ($entry.Key -match '^[a-z]:\\') { $prefixes += "\\?\$($entry.Key)" }
+        foreach ($prefix in $prefixes | Select-Object -Unique) {
+            $rustFlags += "--remap-path-prefix=$prefix=$($entry.Value)"
+        }
+    }
+    $rustFlags += '-C', 'link-arg=/PDBALTPATH:%_PDB%'
+    try {
+        $env:CARGO_ENCODED_RUSTFLAGS = $rustFlags -join $separator
+        & $CargoWrapper @buildArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "Release build failed ($LASTEXITCODE)"
+        }
+    } finally {
+        $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags
     }
 }
 
@@ -49,10 +73,31 @@ if (-not (Test-Path -LiteralPath $builtExe)) {
     throw "Expected compiled executable not found at $builtExe"
 }
 
+# Rust source remapping is best effort. Also check the actual distributable PE.
+$binary = [IO.File]::ReadAllBytes($builtExe)
+$binaryStrings = @(
+    [Text.Encoding]::UTF8.GetString($binary)
+    [Text.Encoding]::Unicode.GetString($binary)
+    [Text.Encoding]::Unicode.GetString($binary, 1, $binary.Length - 1)
+)
+foreach ($directory in @($pathRemaps.Keys) + @($env:USERPROFILE)) {
+    if (!$directory) { continue }
+    $native = $directory.TrimEnd('\', '/') + '\'
+    $portable = $native.Replace('\', '/')
+    if ($binaryStrings | Where-Object {
+        $_.IndexOf($native, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+        $_.IndexOf($portable, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    }) {
+        throw 'The release executable still contains a local build path. Rebuild with this packaging script before publishing.'
+    }
+}
+
 $artifacts = Join-Path $root 'artifacts'
 $runId = [guid]::NewGuid().ToString()
-$staging = Join-Path $root ".local\packaging\$runId\drop"
-$componentScan = Join-Path $root ".local\packaging\$runId\components"
+$stagingRoot = Join-Path $root '.local\packaging'
+$runRoot = Join-Path $stagingRoot $runId
+$staging = Join-Path $runRoot 'drop'
+$componentScan = Join-Path $runRoot 'components'
 $stem = "ag-account-switcher-lite-$version-win-x64"
 $zip = Join-Path $artifacts "$stem.zip"
 New-Item -ItemType Directory -Force -Path $artifacts, $staging, $componentScan | Out-Null
@@ -113,8 +158,12 @@ try {
     Set-Content -Encoding ascii -LiteralPath ($zip + '.sha256') -Value "$sha256 *$stem.zip"
     Write-Output $zip
 } finally {
-    $parentStaging = Join-Path $root ".local\packaging\$runId"
-    if (Test-Path -LiteralPath $parentStaging) {
-        Remove-Item -LiteralPath $parentStaging -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $runRoot) {
+        $resolvedRun = (Resolve-Path -LiteralPath $runRoot).ProviderPath
+        $resolvedRoot = (Resolve-Path -LiteralPath $stagingRoot).ProviderPath.TrimEnd('\') + '\'
+        if ($resolvedRun.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase) -and
+            (Split-Path -Leaf $resolvedRun) -eq $runId) {
+            Remove-Item -LiteralPath $resolvedRun -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }

@@ -20,9 +20,10 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 
 # 构建 Release 可执行文件并生成候选 ZIP 包
-cargo build --locked --release
 ./scripts/package.ps1
 ```
+
+离线环境可在工具链和依赖已缓存时使用 `--offline`。便携工具链可通过 `-CargoWrapper` 传入打包脚本。
 
 ## 测试安全说明
 

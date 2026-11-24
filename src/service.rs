@@ -72,7 +72,10 @@ impl Journal {
 }
 
 fn credential_io<T>(result: io::Result<T>) -> Result<T> {
-    result.map_err(|_| "vault_unavailable")
+    result.map_err(|error| match error.kind() {
+        io::ErrorKind::FileTooLarge => "credential_too_large",
+        _ => "vault_unavailable",
+    })
 }
 
 fn validate_slot(slot: u8) -> Result<()> {
@@ -401,6 +404,23 @@ mod tests {
             .unwrap()
             .unwrap()
             .same_session(&fake_session(value))
+    }
+
+    #[test]
+    fn oversized_credential_keeps_previous_vault_entry() {
+        let fixture = Fixture::new();
+        let vault = fixture.vault();
+        let mut previous = fake_session(7);
+        previous.secret.resize(2560, 7);
+        assert_eq!(credential_io(vault.update_active(&previous)), Ok(()));
+
+        let mut too_large = fake_session(8);
+        too_large.secret.resize(2561, 8);
+        assert_eq!(
+            credential_io(vault.update_active(&too_large)),
+            Err("credential_too_large")
+        );
+        assert!(vault.active().unwrap().unwrap().same_session(&previous));
     }
 
     #[test]

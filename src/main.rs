@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod client;
+mod config_file;
 mod service;
 mod shell;
 mod switch_lock;
@@ -53,19 +54,20 @@ struct Overview {
 }
 
 #[tauri::command]
-async fn overview(app: AppHandle) -> Reply<Overview> {
-    let shell_status = app
-        .try_state::<shell::Shell>()
+fn shell_status(app: AppHandle) -> Reply<shell::ShellStatus> {
+    app.try_state::<shell::Shell>()
         .map(|s| s.status())
-        .ok_or_else(|| String::from("operation_failed"))?;
+        .ok_or_else(|| String::from("operation_failed"))
+}
+
+#[tauri::command]
+async fn overview(app: AppHandle) -> Reply<Overview> {
+    let shell_status = shell_status(app.clone())?;
     with_vault(app, false, move |vault, root| {
         let installed = client::installed();
-        if let Some(executable) = installed.as_deref() {
-            client::observe_running_launch_plan(executable, root);
-        }
         Ok(Overview {
             app_installed: installed.is_some(),
-            client_running: client::require_closed().is_err(),
+            client_running: client::inspect_running(installed.as_deref(), root),
             accounts: service::status(vault)?,
             shell: shell_status,
         })
@@ -103,7 +105,7 @@ async fn switch_account(app: AppHandle, slot: u8) -> Reply<()> {
             vault,
             slot,
             || client::prepare_switch(&executable, root),
-            client::require_closed,
+            || client::require_closed_for(Some(&executable)),
             |plan| client::open(&executable, &plan),
         )
     })
@@ -224,6 +226,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             overview,
+            shell_status,
             register_account,
             update_saved_account,
             remove_account,

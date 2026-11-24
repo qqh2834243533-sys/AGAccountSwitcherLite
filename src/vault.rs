@@ -4,8 +4,8 @@ use std::io;
 use std::{ptr, slice};
 use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
 use windows_sys::Win32::Security::Credentials::{
-    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
-    CRED_TYPE_GENERIC,
+    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_MAX_CREDENTIAL_BLOB_SIZE,
+    CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -270,6 +270,10 @@ fn read(target: &str) -> io::Result<Option<Credential>> {
 }
 
 fn write(target: &str, credential: &Credential, comment: Option<&str>) -> io::Result<()> {
+    let blob_size = u32::try_from(credential.secret.len())
+        .ok()
+        .filter(|&size| size <= CRED_MAX_CREDENTIAL_BLOB_SIZE)
+        .ok_or(io::ErrorKind::FileTooLarge)?;
     let mut target = wide(target);
     let mut user = wide(&credential.user);
     let mut comment_buf = comment.map(wide);
@@ -286,7 +290,7 @@ fn write(target: &str, credential: &Credential, comment: Option<&str>) -> io::Re
         Some(buf) => buf.as_mut_ptr(),
         None => ptr::null_mut(),
     };
-    raw.CredentialBlobSize = credential.secret.len() as u32;
+    raw.CredentialBlobSize = blob_size;
     raw.CredentialBlob = credential.secret.as_ptr().cast_mut();
     // CredWriteW atomically replaces an existing entry without a delete-first outage window.
     if unsafe { CredWriteW(&raw, 0) } == 0 {

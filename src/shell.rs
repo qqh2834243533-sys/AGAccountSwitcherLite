@@ -18,6 +18,7 @@ use tauri::{
 };
 use windows_sys::Win32::{
     Foundation::{ERROR_FILE_NOT_FOUND, ERROR_HOTKEY_ALREADY_REGISTERED, ERROR_SUCCESS},
+    Globalization::GetUserDefaultUILanguage,
     Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
         DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -48,7 +49,6 @@ const SHELL_CONFIG_FILE: &str = "shell.json";
 const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APPROVED_SUBKEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
-const INTL_SUBKEY: &str = r"Control Panel\International";
 const RUN_VALUE_NAME: &str = "AGAccountSwitcherLite";
 const WM_HOTKEY_CMD: u32 = WM_APP + 1;
 const PRODUCTION_HOTKEY_ID: i32 = 1;
@@ -151,6 +151,7 @@ impl Default for UiPrefs {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellStatus {
+    pub chinese: bool,
     pub autostart: bool,
     pub autostart_blocked: bool,
     pub hotkey: Option<String>,
@@ -242,15 +243,8 @@ fn save_shell_config(
         particles_follow: prefs.particles_follow,
     };
     let serialized = serde_json::to_string_pretty(&payload).map_err(|_| "operation_failed")?;
-    let final_path = data_root.join(SHELL_CONFIG_FILE);
-    let temp_path = data_root.join(format!("{SHELL_CONFIG_FILE}.{}.tmp", std::process::id()));
-    fs::write(&temp_path, &serialized).map_err(|_| "data_folder_unavailable")?;
-    if fs::rename(&temp_path, &final_path).is_err() {
-        let write_result = fs::write(&final_path, &serialized);
-        let _ = fs::remove_file(&temp_path);
-        write_result.map_err(|_| "data_folder_unavailable")?;
-    }
-    Ok(())
+    crate::config_file::replace(&data_root.join(SHELL_CONFIG_FILE), serialized.as_bytes())
+        .map_err(|_| "data_folder_unavailable")
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -461,8 +455,9 @@ fn set_autostart_in(
 }
 
 fn is_chinese_locale() -> bool {
-    read_reg_sz(INTL_SUBKEY, "LocaleName")
-        .is_some_and(|locale| locale.to_ascii_lowercase().starts_with("zh"))
+    const PRIMARY_LANGUAGE_MASK: u16 = 0x03ff;
+    const LANG_CHINESE: u16 = 0x0004;
+    (unsafe { GetUserDefaultUILanguage() } & PRIMARY_LANGUAGE_MASK) == LANG_CHINESE
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -706,6 +701,7 @@ fn is_reserved_combo(ctrl: bool, alt: bool, shift: bool, win: bool, key: &str) -
 enum WorkerCmd {
     Apply(
         Option<Shortcut>,
+        bool,
         SyncSender<Result<HotkeyStatus, &'static str>>,
     ),
     SetSuspended(bool, SyncSender<HotkeyStatus>),
@@ -771,7 +767,7 @@ impl HotkeyWorker {
                             break;
                         };
                         match cmd {
-                            WorkerCmd::Apply(next, reply) => {
+                            WorkerCmd::Apply(next, restore_on_conflict, reply) => {
                                 let prev_desired = desired;
                                 let prev_was_active =
                                     registered || (suspended && status == HotkeyStatus::Active);
@@ -791,6 +787,11 @@ impl HotkeyWorker {
                                             desired = Some(sc);
                                             registered = true;
                                             status = HotkeyStatus::Active;
+                                            let _ = reply.send(Ok(status));
+                                        }
+                                        Err(_) if !restore_on_conflict => {
+                                            desired = next;
+                                            status = HotkeyStatus::Conflict;
                                             let _ = reply.send(Ok(status));
                                         }
                                         Err(reason) => {
@@ -864,16 +865,26 @@ impl HotkeyWorker {
         if self.thread_id == 0 {
             return false;
         }
-        self.queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(cmd);
-        unsafe { PostThreadMessageW(self.thread_id, WM_HOTKEY_CMD, 0, 0) != 0 }
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.push_back(cmd);
+        let posted = unsafe { PostThreadMessageW(self.thread_id, WM_HOTKEY_CMD, 0, 0) != 0 };
+        if !posted {
+            queue.pop_back();
+        }
+        posted
     }
 
     fn apply(&self, next: Option<Shortcut>) -> Result<HotkeyStatus, &'static str> {
+        self.apply_with_conflict_policy(next, true)
+    }
+
+    fn apply_with_conflict_policy(
+        &self,
+        next: Option<Shortcut>,
+        restore_on_conflict: bool,
+    ) -> Result<HotkeyStatus, &'static str> {
         let (tx, rx) = mpsc::sync_channel(1);
-        if !self.post(WorkerCmd::Apply(next, tx)) {
+        if !self.post(WorkerCmd::Apply(next, restore_on_conflict, tx)) {
             return Err("operation_failed");
         }
         rx.recv().map_err(|_| "operation_failed")?
@@ -1096,12 +1107,46 @@ impl Drop for OpGuard<'_> {
     }
 }
 
+struct ShellConfigState {
+    shortcut: Option<Shortcut>,
+    hotkey_status: HotkeyStatus,
+    prefs: UiPrefs,
+}
+
+impl ShellConfigState {
+    fn set_hotkey(
+        &mut self,
+        worker: &HotkeyWorker,
+        shortcut: Option<Shortcut>,
+        persist: impl FnOnce(Option<&str>, UiPrefs) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        let status = match worker.apply(shortcut) {
+            Ok(status) => status,
+            Err(reason) => {
+                if let Some(actual) = worker.set_suspended(false) {
+                    self.hotkey_status = actual;
+                }
+                return Err(reason);
+            }
+        };
+        let label = shortcut.map(Shortcut::canonical);
+        if let Err(reason) = persist(label.as_deref(), self.prefs) {
+            self.hotkey_status = worker
+                .apply_with_conflict_policy(self.shortcut, false)
+                .unwrap_or(HotkeyStatus::Conflict);
+            return Err(reason);
+        }
+        self.shortcut = shortcut;
+        self.hotkey_status = status;
+        Ok(())
+    }
+}
+
 pub struct Shell {
     data_root: PathBuf,
     chinese: bool,
     hotkey_worker: HotkeyWorker,
-    hotkey_state: Mutex<(Option<String>, HotkeyStatus)>,
-    prefs: Mutex<UiPrefs>,
+    config: Mutex<ShellConfigState>,
     show_item: MenuItem<Wry>,
     autostart_item: CheckMenuItem<Wry>,
     tray: TrayIcon<Wry>,
@@ -1132,7 +1177,10 @@ impl Shell {
         let (hotkey_worker, initial_status) = HotkeyWorker::start(
             parsed_shortcut,
             PRODUCTION_HOTKEY_ID,
-            Arc::new(move || toggle_window(&trigger_app)),
+            Arc::new(move || {
+                let app = trigger_app.clone();
+                let _ = trigger_app.run_on_main_thread(move || toggle_window(&app));
+            }),
         );
 
         let current_exe = env::current_exe().ok();
@@ -1226,8 +1274,11 @@ impl Shell {
             data_root,
             chinese,
             hotkey_worker,
-            hotkey_state: Mutex::new((initial_label, initial_status)),
-            prefs: Mutex::new(initial_prefs),
+            config: Mutex::new(ShellConfigState {
+                shortcut: parsed_shortcut,
+                hotkey_status: initial_status,
+                prefs: initial_prefs,
+            }),
             show_item,
             autostart_item,
             tray,
@@ -1250,7 +1301,11 @@ impl Shell {
     }
 
     pub fn theme_mode(&self) -> ThemeMode {
-        self.prefs.lock().unwrap_or_else(|e| e.into_inner()).theme
+        self.config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefs
+            .theme
     }
 
     fn prepare_quit(&self) {
@@ -1266,20 +1321,16 @@ impl Shell {
     pub fn status(&self) -> ShellStatus {
         let (autostart, autostart_blocked) = self.inspect_autostart();
         let _ = self.autostart_item.set_checked(autostart);
-        let (hotkey, status) = self
-            .hotkey_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let prefs = *self.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let config = self.config.lock().unwrap_or_else(|e| e.into_inner());
         ShellStatus {
+            chinese: self.chinese,
             autostart,
             autostart_blocked,
-            hotkey,
-            hotkey_status: status.as_str(),
-            layout: prefs.layout.as_str(),
-            theme: prefs.theme.as_str(),
-            particles_follow: prefs.particles_follow,
+            hotkey: config.shortcut.map(Shortcut::canonical),
+            hotkey_status: config.hotkey_status.as_str(),
+            layout: config.prefs.layout.as_str(),
+            theme: config.prefs.theme.as_str(),
+            particles_follow: config.prefs.particles_follow,
         }
     }
 
@@ -1301,21 +1352,19 @@ impl Shell {
                 }
             },
         };
-        let next_status = self.hotkey_worker.apply(parsed)?;
-        let canonical = parsed.map(Shortcut::canonical);
-        let prefs = *self.prefs.lock().unwrap_or_else(|e| e.into_inner());
-        save_shell_config(&self.data_root, canonical.as_deref(), prefs)?;
-
         {
-            let mut guard = self.hotkey_state.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = (canonical.clone(), next_status);
+            let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            config.set_hotkey(&self.hotkey_worker, parsed, |label, prefs| {
+                save_shell_config(&self.data_root, label, prefs)
+            })?;
+            let canonical = parsed.map(Shortcut::canonical);
+            let _ = self
+                .show_item
+                .set_text(format_show_label(self.chinese, canonical.as_deref()));
+            let _ = self
+                .tray
+                .set_tooltip(Some(format_tooltip(self.chinese, canonical.as_deref())));
         }
-        let _ = self
-            .show_item
-            .set_text(format_show_label(self.chinese, canonical.as_deref()));
-        let _ = self
-            .tray
-            .set_tooltip(Some(format_tooltip(self.chinese, canonical.as_deref())));
 
         Ok(self.status())
     }
@@ -1332,27 +1381,24 @@ impl Shell {
             theme,
             particles_follow,
         };
-        let hotkey = self
-            .hotkey_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .0
-            .clone();
-        save_shell_config(&self.data_root, hotkey.as_deref(), next_prefs)?;
         {
-            let mut guard = self.prefs.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = next_prefs;
+            let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            let hotkey = config.shortcut.map(Shortcut::canonical);
+            save_shell_config(&self.data_root, hotkey.as_deref(), next_prefs)?;
+            config.prefs = next_prefs;
         }
         apply_window_theme(app, theme);
         Ok(self.status())
     }
 
     pub fn set_hotkey_suspended(&self, suspended: bool) {
-        if let Some(updated_status) = self.hotkey_worker.set_suspended(suspended) {
-            if !suspended {
-                let mut guard = self.hotkey_state.lock().unwrap_or_else(|e| e.into_inner());
-                guard.1 = updated_status;
-            }
+        let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = self
+            .hotkey_worker
+            .set_suspended(suspended)
+            .filter(|_| !suspended)
+        {
+            config.hotkey_status = status;
         }
     }
 }
@@ -1656,6 +1702,39 @@ mod tests {
         drop(third);
         drop(probe);
 
+        assert_eq!(primary.set_suspended(false), Some(HotkeyStatus::Active));
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(SHELL_CONFIG_FILE)).unwrap();
+        let mut config = ShellConfigState {
+            shortcut: Some(sc),
+            hotkey_status: HotkeyStatus::Active,
+            prefs: UiPrefs::default(),
+        };
+        assert_eq!(
+            config.set_hotkey(&primary, None, |label, prefs| {
+                save_shell_config(dir.path(), label, prefs)
+            }),
+            Err("data_folder_unavailable")
+        );
+        assert_eq!(config.shortcut, Some(sc));
+        assert_eq!(config.hotkey_status, HotkeyStatus::Active);
+        let (probe, status) = HotkeyWorker::start(Some(sc), 705, Arc::new(|| {}));
+        assert_eq!(status, HotkeyStatus::Conflict);
+        drop(probe);
+
+        let mut conflicting_worker = None;
+        assert_eq!(
+            config.set_hotkey(&primary, None, |_, _| {
+                let (worker, status) = HotkeyWorker::start(Some(sc), 706, Arc::new(|| {}));
+                assert_eq!(status, HotkeyStatus::Active);
+                conflicting_worker = Some(worker);
+                Err("data_folder_unavailable")
+            }),
+            Err("data_folder_unavailable")
+        );
+        assert_eq!(config.shortcut, Some(sc));
+        assert_eq!(config.hotkey_status, HotkeyStatus::Conflict);
+        drop(conflicting_worker);
         assert_eq!(primary.set_suspended(false), Some(HotkeyStatus::Active));
         assert_eq!(primary.apply(None), Ok(HotkeyStatus::Disabled));
     }
