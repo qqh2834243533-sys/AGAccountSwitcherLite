@@ -2,11 +2,11 @@
 
 ## 模块分层
 
-AG Account Switcher Lite (`0.1.2`) 是面向 Windows 11 x64 的单可执行文件 Tauri 2 应用，由四个高内聚层组成：
+AG Account Switcher Lite (`0.2.0`) 是面向 Windows 11 x64 的单可执行文件 Tauri 2 应用，由四个高内聚层组成：
 
 1. **WebView2 表现层 (`ui/index.html`, `ui/app.js`, `ui/style.css`)**
    - 原生 HTML/CSS/JS 实现，零第三方前端框架依赖，启用严格 CSP 且 `capabilities/main.json` 权限集为空（`permissions: []`）。
-   - 仅接收脱敏后的槽位编号（`1..=4`）、备注名称、当前活动槽位标识、恢复状态及自启/热键壳层状态；支持自定义热键录制、数字键 `1`–`4` 切号与 `Esc` 隐藏回托盘，客户端正在运行时弹出轻量切换确认对话框。
+   - 支持「矩阵」与「列表」双布局风格、深浅色切换及自适应放射星环粒子 `<canvas>`（隐藏回托盘自动暂停渲染）；仅接收脱敏后的槽位编号（`1..=4`）、备注名称、当前活动槽位标识、恢复状态及壳层偏好状态，支持热键录制、数字键 `1`–`4` 切号与 `Esc` 隐藏回托盘。
 2. **IPC、桌面壳层与互斥入口层 (`src/main.rs`, `src/shell.rs`, `src/switch_lock.rs`)**
    - 注册 `tauri-plugin-single-instance` 保证同一会话内单窗口实例，二次运行自动唤醒托盘隐藏窗口（`--autostart` 开机静默入驻托盘）；
    - `shell.rs` 统一管理系统托盘常驻、当前用户注册表 `HKCU\...\Run` 开机自启（含便携目录迁移路径自愈）与独立 Win32 消息循环全局热键线程（`shell.json` 原子持久化自定义热键）；

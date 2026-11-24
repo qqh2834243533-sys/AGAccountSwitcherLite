@@ -146,8 +146,33 @@ fn set_hotkey_suspended(app: AppHandle, suspended: bool) {
 }
 
 #[tauri::command]
+fn set_preferences(
+    app: AppHandle,
+    layout: String,
+    theme: String,
+    particles_follow: bool,
+) -> Reply<shell::ShellStatus> {
+    let layout = shell::LayoutMode::parse(&layout)?;
+    let theme = shell::ThemeMode::parse(&theme)?;
+    let state = app.try_state::<shell::Shell>().ok_or("operation_failed")?;
+    state
+        .set_preferences(&app, layout, theme, particles_follow)
+        .map_err(String::from)
+}
+
+#[tauri::command]
 fn hide_window(app: AppHandle) {
     shell::hide_window(&app);
+}
+
+#[tauri::command]
+fn minimize_window(app: AppHandle) {
+    shell::minimize_window(&app);
+}
+
+#[tauri::command]
+fn start_drag(app: AppHandle) {
+    shell::start_dragging(&app);
 }
 
 fn has_autostart_flag<I, S>(args: I) -> bool
@@ -177,15 +202,23 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    let keep_in_tray = window
-                        .app_handle()
-                        .try_state::<shell::Shell>()
-                        .is_some_and(|state| !state.is_quitting());
-                    if keep_in_tray {
-                        api.prevent_close();
-                        let _ = window.hide();
+                match event {
+                    WindowEvent::CloseRequested { api, .. } => {
+                        let keep_in_tray = window
+                            .app_handle()
+                            .try_state::<shell::Shell>()
+                            .is_some_and(|state| !state.is_quitting());
+                        if keep_in_tray {
+                            api.prevent_close();
+                            let _ = window.hide();
+                        }
                     }
+                    WindowEvent::ScaleFactorChanged { .. } => {
+                        if let Some(webview) = window.app_handle().get_webview_window("main") {
+                            shell::adapt_window_to_monitor(&webview);
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
@@ -200,7 +233,10 @@ fn main() {
             set_autostart,
             set_hotkey,
             set_hotkey_suspended,
+            set_preferences,
             hide_window,
+            minimize_window,
+            start_drag,
         ])
         .run(tauri::generate_context!())
         .expect("Unable to start AG Account Switcher Lite");

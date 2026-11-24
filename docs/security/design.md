@@ -1,6 +1,6 @@
 # 安全设计 (Security Design)
 
-| 安全域 | `0.1.2`（Rust + Tauri 2）实现机制 |
+| 安全域 | `0.2.0`（Rust + Tauri 2）实现机制 |
 | --- | --- |
 | **网络、遥测与模型代理** | 应用源码无任何网络客户端、HTTP 回调服务器、额度查询、自动更新拉取或模型 API 代理。 |
 | **凭据存储与内存保护** | 槽位凭据（`ag-account-switcher-lite:v1:account:1..=4`）与恢复日志存放在当前 Windows 用户的 Credential Manager（`CRED_TYPE_GENERIC`）；`CredWriteW` 原地替换避免先删后写断档；原始字节装入 `Zeroizing<Vec<u8>>`，JWT `sub` 与 `refresh_token` 解析结构体在 `Drop` 时显式执行 `zeroize()` 清零。 |

@@ -1,5 +1,15 @@
 # 验证与准入记录 (Verification Log)
 
+## 2026-11-24 `v0.2.0` 无边框双模式光谱界面与 DPI 自适应重构验证
+
+- **核心改动范围**：重构 `ui/`（`index.html`、`style.css`、`app.js`）为统一 Antigravity 光谱语言的无边框圆角窗口，支持「矩阵 / 列表」双布局、深浅色切换及自适应放射星环 `<canvas>`（隐藏回托盘自动暂停渲染，后台 0% CPU）；扩展 `src/shell.rs` 与 `src/main.rs` 持久化界面偏好、压制 DWM 四周系统强调色边线并按显示器工作区与 DPI 自适应 `1:1` 偶数物理像素尺寸；核心凭据与安全层（`vault.rs`、`service.rs`、`client.rs`、`switch_lock.rs`）及 `capabilities/main.json`（`permissions: []`）保持不变，SPDX 2.2 SBOM 维持 502 个 Rust 依赖组件零新增。
+- **离线质量门禁与夹具测试**：
+  - `cargo fmt --all -- --check`、`cargo clippy --locked --offline --all-targets -- -D warnings` 零差异、零告警通过；
+  - 前端 DOM ID、双语词条完整性及严格 `style-src 'self'` 零内联样式校验通过；
+  - `cargo test --locked --offline` **29 项通过 / 0 失败 / 4 项真机或子进程辅助忽略用例**（新增 `shell.json` 旧版兼容与布局/主题枚举解析测试、多分辨率与多 DPI `1:1` 物理像素自适应不变量测试）。
+
+---
+
 ## 2026-11-24 `v0.1.1` 托盘常驻、开机自启与自定义快速唤出发布验证
 
 - **核心改动范围**：新增单一壳层模块 `src/shell.rs` 并最小化扩展 `src/main.rs` 与 `ui/`；核心安全层（`vault.rs`、`service.rs`、`client.rs`、`switch_lock.rs`）及 `capabilities/main.json`（`permissions: []`）保持 0 行改动，SPDX 2.2 SBOM 维持 502 个 Rust 依赖组件零膨胀。

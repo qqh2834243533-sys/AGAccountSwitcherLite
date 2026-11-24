@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light" data-layout="matrix">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -8,49 +8,222 @@
   <script src="app.js" type="module"></script>
 </head>
 <body>
-  <main>
-    <header>
-      <div>
-        <h1 id="title">Antigravity 账号</h1>
-        <p id="intro">点击已保存的账号，在原生 App 中打开。</p>
+  <!-- Reusable SVG ClipPath & Mesh Blur for Stacked Dual-Arch Spectrum Emblem -->
+  <svg width="0" height="0" class="svg-defs" aria-hidden="true">
+    <defs>
+      <clipPath id="ag-arch-back" clipPathUnits="userSpaceOnUse">
+        <path transform="translate(-4, 14) scale(0.76)" d="M175.28 181.64C185.19 189.07 200.06 184.12 186.43 170.48C145.54 130.83 154.21 21.78 103.40 21.78C52.60 21.78 61.27 130.83 20.38 170.48C5.51 185.35 21.62 189.07 31.53 181.64C69.95 155.61 67.47 109.76 103.40 109.76C139.34 109.76 136.86 155.61 175.28 181.64Z" />
+      </clipPath>
+      <clipPath id="ag-arch-front" clipPathUnits="userSpaceOnUse">
+        <path transform="translate(76, 4) scale(0.80)" d="M175.28 181.64C185.19 189.07 200.06 184.12 186.43 170.48C145.54 130.83 154.21 21.78 103.40 21.78C52.60 21.78 61.27 130.83 20.38 170.48C5.51 185.35 21.62 189.07 31.53 181.64C69.95 155.61 67.47 109.76 103.40 109.76C139.34 109.76 136.86 155.61 175.28 181.64Z" />
+      </clipPath>
+      <filter id="ag-mesh-blur" x="-35%" y="-35%" width="170%" height="170%">
+        <feGaussianBlur stdDeviation="16" />
+      </filter>
+    </defs>
+  </svg>
+
+  <canvas id="starburst-canvas" aria-hidden="true"></canvas>
+
+  <main class="app-shell">
+    <header id="topbar" class="topbar">
+      <div class="brand-group">
+        <svg class="brand-icon" width="25" height="20" viewBox="0 0 236 176" fill="none" aria-hidden="true">
+          <g clip-path="url(#ag-arch-back)" opacity="0.90">
+            <rect width="236" height="176" fill="#2274f8" />
+            <g filter="url(#ag-mesh-blur)">
+              <ellipse cx="94" cy="48" rx="38" ry="34" fill="#ff4b3a" />
+              <ellipse cx="58" cy="40" rx="34" ry="28" fill="#fbbc04" />
+              <ellipse cx="38" cy="78" rx="28" ry="34" fill="#2ec46d" />
+              <ellipse cx="100" cy="84" rx="24" ry="22" fill="#6d5dfc" />
+              <ellipse cx="76" cy="134" rx="68" ry="42" fill="#1d6bf3" />
+            </g>
+          </g>
+          <path class="arch-separator" transform="translate(76, 4) scale(0.80)" d="M175.28 181.64C185.19 189.07 200.06 184.12 186.43 170.48C145.54 130.83 154.21 21.78 103.40 21.78C52.60 21.78 61.27 130.83 20.38 170.48C5.51 185.35 21.62 189.07 31.53 181.64C69.95 155.61 67.47 109.76 103.40 109.76C139.34 109.76 136.86 155.61 175.28 181.64Z" stroke-width="5" />
+          <g clip-path="url(#ag-arch-front)">
+            <rect width="236" height="176" fill="#2274f8" />
+            <g filter="url(#ag-mesh-blur)">
+              <ellipse cx="178" cy="38" rx="40" ry="35" fill="#ff4b3a" />
+              <ellipse cx="141" cy="31" rx="36" ry="29" fill="#fbbc04" />
+              <ellipse cx="120" cy="72" rx="28" ry="36" fill="#2ec46d" />
+              <ellipse cx="185" cy="78" rx="25" ry="24" fill="#6d5dfc" />
+              <ellipse cx="159" cy="132" rx="72" ry="44" fill="#1d6bf3" />
+            </g>
+          </g>
+        </svg>
+        <h1 id="title" class="brand-title">AG Switcher</h1>
+        <span id="mode-badge" class="chip-badge">矩阵</span>
+        <span id="count" class="slot-count" hidden></span>
       </div>
-      <span id="count" class="count" hidden></span>
+
+      <div id="drag-zone" class="drag-zone" title="按住拖动窗口">
+        <span class="drag-grip" aria-hidden="true">
+          <svg width="20" height="8" viewBox="0 0 20 8" fill="currentColor">
+            <circle cx="4" cy="2" r="1.25"></circle>
+            <circle cx="10" cy="2" r="1.25"></circle>
+            <circle cx="16" cy="2" r="1.25"></circle>
+            <circle cx="4" cy="6" r="1.25"></circle>
+            <circle cx="10" cy="6" r="1.25"></circle>
+            <circle cx="16" cy="6" r="1.25"></circle>
+          </svg>
+        </span>
+      </div>
+
+      <div class="top-actions">
+        <span id="status-pill" class="status-pill" data-tone="idle">
+          <span class="status-dot"></span>
+          <span id="status-pill-text">待命</span>
+        </span>
+        <button id="theme-toggle" type="button" class="icon-btn" aria-label="切换深浅色" title="切换深浅色">
+          <svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+          </svg>
+          <svg class="icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"></path>
+          </svg>
+        </button>
+        <button id="settings-toggle" type="button" class="icon-btn" aria-expanded="false" aria-controls="settings-popover" aria-label="设置" title="设置">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+        <span class="top-divider" aria-hidden="true"></span>
+        <button id="win-minimize" type="button" class="icon-btn" aria-label="最小化" title="最小化">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" aria-hidden="true">
+            <path d="M5 12h14"></path>
+          </svg>
+        </button>
+        <button id="win-close" type="button" class="icon-btn win-close-btn" aria-label="收起至托盘" title="收起至托盘 (Esc)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18"></path>
+          </svg>
+        </button>
+      </div>
     </header>
-    <p id="notice" role="status" aria-live="polite"></p>
-    <ul id="accounts" aria-label="已保存的账号"></ul>
-    <form id="registration" hidden>
-      <label for="label" id="label-title">账号名称</label>
-      <div class="input-row">
-        <input id="label" autocomplete="off" maxlength="48" required>
-        <button type="submit" class="primary" id="save">保存</button>
-        <button type="button" id="cancel-registration">取消</button>
+
+    <!-- Settings Popover -->
+    <section id="settings-popover" class="settings-popover" hidden aria-label="设置面板">
+      <div class="popover-head">
+        <span id="settings-title" class="popover-title">视图与驻留设置</span>
+        <button id="settings-close" type="button" class="pill-btn subtle-btn">完成</button>
       </div>
-    </form>
-    <footer>
-      <button id="register" type="button" class="primary">登记当前账号</button>
-      <button id="restore" type="button" hidden>恢复切换前会话</button>
-      <button id="forget" type="button" hidden>清除恢复记录</button>
-      <button id="reload" type="button" hidden>重试</button>
-    </footer>
-    <section class="shell-bar" id="shell-bar">
-      <label class="toggle">
-        <input id="autostart" type="checkbox">
-        <span id="autostart-label">开机自启</span>
-      </label>
-      <div class="hotkey-row">
-        <span id="hotkey-title" class="muted-label">快速唤出</span>
-        <kbd id="hotkey-display">Alt+Shift+G</kbd>
-        <button id="hotkey-edit" type="button" class="compact">修改</button>
-        <button id="hotkey-clear" type="button" class="compact" hidden>禁用</button>
+
+      <div class="setting-group">
+        <span id="style-label" class="setting-caption">风格切换</span>
+        <div class="segmented-bar" role="group" aria-labelledby="style-label">
+          <button id="mode-list" type="button" class="seg-btn">列表</button>
+          <button id="mode-matrix" type="button" class="seg-btn">矩阵</button>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <span id="appearance-label" class="setting-caption">外观主题</span>
+        <div class="segmented-bar segmented-three" role="group" aria-labelledby="appearance-label">
+          <button id="theme-system" type="button" class="seg-btn">自动</button>
+          <button id="theme-light" type="button" class="seg-btn">浅色</button>
+          <button id="theme-dark" type="button" class="seg-btn">深色</button>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-copy">
+          <span id="particles-label" class="setting-name">星环跟随鼠标</span>
+          <span id="particles-hint" class="setting-sub">移出窗口时全背景均匀呼吸</span>
+        </div>
+        <button id="particles-switch" type="button" class="switch-pill" role="switch" aria-checked="true" data-on="true">
+          <span class="switch-dot"></span>
+        </button>
+      </div>
+
+      <div class="setting-row">
+        <span id="autostart-label" class="setting-name">开机静默自启</span>
+        <button id="autostart-switch" type="button" class="switch-pill" role="switch" aria-checked="false" data-on="false">
+          <span class="switch-dot"></span>
+        </button>
+      </div>
+
+      <div class="setting-row hotkey-setting">
+        <span id="hotkey-title" class="setting-name">全局快速唤出</span>
+        <div class="hotkey-controls">
+          <button id="hotkey-edit" type="button" class="pill-btn subtle-btn">修改</button>
+          <button id="hotkey-clear" type="button" class="pill-btn subtle-btn" hidden>禁用</button>
+        </div>
       </div>
     </section>
-    <p id="guidance"></p>
-    <dialog id="confirm">
-      <form method="dialog">
-        <p id="confirm-text"></p>
-        <div class="input-row">
-          <button id="no" value="cancel">取消</button>
-          <button id="yes" value="confirm">确认</button>
+
+    <!-- Main Workspace Stage Below Partitioned Topbar -->
+    <div class="workspace-body">
+      <!-- Contextual Notice & Recovery Strip -->
+      <div id="notice-bar" class="notice-bar" hidden role="status" aria-live="polite">
+        <span id="notice" class="notice-text"></span>
+        <div class="notice-actions">
+          <button id="restore" type="button" class="pill-btn cta-btn" hidden>恢复切换前会话</button>
+          <button id="forget" type="button" class="pill-btn subtle-btn" hidden>清除恢复记录</button>
+          <button id="reload" type="button" class="pill-btn cta-btn" hidden>重试</button>
+        </div>
+      </div>
+
+      <!-- Inline Registration Bar -->
+      <form id="registration" class="registration-card" hidden>
+        <span id="reg-slot-badge" class="slot-key">#1</span>
+        <input id="label" type="text" autocomplete="off" maxlength="48" required aria-label="账号名称">
+        <button type="submit" class="pill-btn cta-btn" id="save">保存</button>
+        <button type="button" class="pill-btn subtle-btn" id="cancel-registration">取消</button>
+      </form>
+
+      <!-- Main 4-Slot Stage (renders as List Tray or 2x2 Matrix Grid via CSS data-layout) -->
+      <section class="slots-stage">
+        <ul id="accounts" class="slots-container" aria-label="Antigravity 账号"></ul>
+      </section>
+
+      <!-- Footer Bar -->
+      <footer class="bottom-bar">
+        <div class="footer-left">
+          <span id="footer-hint" class="footer-hint">数字键 1–4 速切 · Esc 收回托盘</span>
+          <button id="register" type="button" class="pill-btn cta-btn compact-cta" hidden>＋ 登记当前账号</button>
+          <button id="restore-footer" type="button" class="pill-btn subtle-btn" hidden>恢复上次会话</button>
+          <button id="forget-footer" type="button" class="pill-btn subtle-btn" hidden>清除记录</button>
+        </div>
+        <div class="footer-right">
+          <button id="hotkey-pill" type="button" class="kbd-pill" title="点击录制全局唤出热键">Alt+Shift+G</button>
+        </div>
+      </footer>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <dialog id="confirm" class="confirm-dialog">
+      <form method="dialog" class="dialog-body">
+        <div class="dialog-header">
+          <svg width="22" height="18" viewBox="0 0 236 176" fill="none" aria-hidden="true">
+            <g clip-path="url(#ag-arch-back)" opacity="0.90">
+              <rect width="236" height="176" fill="#2274f8" />
+              <g filter="url(#ag-mesh-blur)">
+                <ellipse cx="94" cy="48" rx="38" ry="34" fill="#ff4b3a" />
+                <ellipse cx="58" cy="40" rx="34" ry="28" fill="#fbbc04" />
+                <ellipse cx="38" cy="78" rx="28" ry="34" fill="#2ec46d" />
+                <ellipse cx="100" cy="84" rx="24" ry="22" fill="#6d5dfc" />
+                <ellipse cx="76" cy="134" rx="68" ry="42" fill="#1d6bf3" />
+              </g>
+            </g>
+            <g clip-path="url(#ag-arch-front)">
+              <rect width="236" height="176" fill="#2274f8" />
+              <g filter="url(#ag-mesh-blur)">
+                <ellipse cx="178" cy="38" rx="40" ry="35" fill="#ff4b3a" />
+                <ellipse cx="141" cy="31" rx="36" ry="29" fill="#fbbc04" />
+                <ellipse cx="120" cy="72" rx="28" ry="36" fill="#2ec46d" />
+                <ellipse cx="185" cy="78" rx="25" ry="24" fill="#6d5dfc" />
+                <ellipse cx="159" cy="132" rx="72" ry="44" fill="#1d6bf3" />
+              </g>
+            </g>
+          </svg>
+          <span id="confirm-title" class="dialog-title">请确认操作</span>
+        </div>
+        <p id="confirm-text" class="dialog-text"></p>
+        <div class="dialog-actions">
+          <button id="no" value="cancel" class="pill-btn subtle-btn">取消</button>
+          <button id="yes" value="confirm" class="pill-btn cta-btn">确认</button>
         </div>
       </form>
     </dialog>

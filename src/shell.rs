@@ -18,6 +18,10 @@ use tauri::{
 };
 use windows_sys::Win32::{
     Foundation::{ERROR_FILE_NOT_FOUND, ERROR_HOTKEY_ALREADY_REGISTERED, ERROR_SUCCESS},
+    Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    },
     System::{
         Registry::{
             RegCloseKey, RegCreateKeyW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
@@ -66,6 +70,84 @@ impl HotkeyStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    List,
+    #[default]
+    Matrix,
+}
+
+impl LayoutMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Matrix => "matrix",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, &'static str> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "list" => Ok(Self::List),
+            "matrix" => Ok(Self::Matrix),
+            _ => Err("invalid_preferences"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, &'static str> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "system" => Ok(Self::System),
+            "light" => Ok(Self::Light),
+            "dark" => Ok(Self::Dark),
+            _ => Err("invalid_preferences"),
+        }
+    }
+
+    pub fn to_tauri_theme(self) -> Option<tauri::Theme> {
+        match self {
+            Self::System => None,
+            Self::Light => Some(tauri::Theme::Light),
+            Self::Dark => Some(tauri::Theme::Dark),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiPrefs {
+    pub layout: LayoutMode,
+    pub theme: ThemeMode,
+    pub particles_follow: bool,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            layout: LayoutMode::Matrix,
+            theme: ThemeMode::System,
+            particles_follow: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellStatus {
@@ -73,17 +155,41 @@ pub struct ShellStatus {
     pub autostart_blocked: bool,
     pub hotkey: Option<String>,
     pub hotkey_status: &'static str,
+    pub layout: &'static str,
+    pub theme: &'static str,
+    pub particles_follow: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShellConfig {
     hotkey: Option<String>,
+    layout: LayoutMode,
+    theme: ThemeMode,
+    particles_follow: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawShellConfig {
+    #[serde(default = "default_raw_hotkey")]
+    hotkey: Option<String>,
+    layout: Option<String>,
+    theme: Option<String>,
+    particles_follow: Option<bool>,
+}
+
+fn default_raw_hotkey() -> Option<String> {
+    Some(DEFAULT_HOTKEY.to_owned())
 }
 
 fn default_shell_config() -> ShellConfig {
+    let prefs = UiPrefs::default();
     ShellConfig {
         hotkey: Some(DEFAULT_HOTKEY.to_owned()),
+        layout: prefs.layout,
+        theme: prefs.theme,
+        particles_follow: prefs.particles_follow,
     }
 }
 
@@ -92,25 +198,48 @@ fn load_shell_config(data_root: &Path) -> ShellConfig {
     let Ok(raw) = fs::read_to_string(path) else {
         return default_shell_config();
     };
-    let Ok(parsed) = serde_json::from_str::<ShellConfig>(&raw) else {
+    let Ok(parsed) = serde_json::from_str::<RawShellConfig>(&raw) else {
         return default_shell_config();
     };
-    match parsed.hotkey {
-        None => ShellConfig { hotkey: None },
-        Some(text) if text.trim().is_empty() => ShellConfig { hotkey: None },
+    let hotkey = match parsed.hotkey {
+        None => None,
+        Some(text) if text.trim().is_empty() => None,
         Some(text) => match Shortcut::parse(&text) {
-            Ok(shortcut) => ShellConfig {
-                hotkey: Some(shortcut.canonical()),
-            },
-            Err(_) => default_shell_config(),
+            Ok(shortcut) => Some(shortcut.canonical()),
+            Err(_) => Some(DEFAULT_HOTKEY.to_owned()),
         },
+    };
+    let layout = parsed
+        .layout
+        .as_deref()
+        .and_then(|s| LayoutMode::parse(s).ok())
+        .unwrap_or_default();
+    let theme = parsed
+        .theme
+        .as_deref()
+        .and_then(|s| ThemeMode::parse(s).ok())
+        .unwrap_or_default();
+    let particles_follow = parsed.particles_follow.unwrap_or(true);
+
+    ShellConfig {
+        hotkey,
+        layout,
+        theme,
+        particles_follow,
     }
 }
 
-fn save_shell_config(data_root: &Path, hotkey: Option<&str>) -> Result<(), &'static str> {
+fn save_shell_config(
+    data_root: &Path,
+    hotkey: Option<&str>,
+    prefs: UiPrefs,
+) -> Result<(), &'static str> {
     fs::create_dir_all(data_root).map_err(|_| "data_folder_unavailable")?;
     let payload = ShellConfig {
         hotkey: hotkey.map(str::to_owned),
+        layout: prefs.layout,
+        theme: prefs.theme,
+        particles_follow: prefs.particles_follow,
     };
     let serialized = serde_json::to_string_pretty(&payload).map_err(|_| "operation_failed")?;
     let final_path = data_root.join(SHELL_CONFIG_FILE);
@@ -801,11 +930,119 @@ fn unbind_os_hotkey(id: i32) {
     }
 }
 
+const LIGHT_TOPBAR_COLORREF: u32 = 0x00F6_ECE8; // RGB(232, 236, 246) -> 0x00BBGGRR
+const DARK_TOPBAR_COLORREF: u32 = 0x0023_1813; // RGB(19, 24, 35) -> 0x00BBGGRR
+
+/// Compute an even 1:1 integer physical-pixel square side adapted to the monitor's
+/// usable work area and hardware DPI scale factor.
+pub fn compute_square_physical_side(work_width: u32, work_height: u32, scale_factor: f64) -> u32 {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.25 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let work_short_phys = work_width.min(work_height).max(360);
+    let logical_short = (work_short_phys as f64) / scale;
+    let target_logical = (logical_short * 0.55).round().clamp(468.0, 548.0);
+    let max_phys = work_short_phys.saturating_sub(40).max(360);
+    let raw_phys = ((target_logical * scale).round() as u32).clamp(360, max_phys);
+    // Round to an even integer so 1:1 physical dimensions divide cleanly at center.
+    raw_phys & !1
+}
+
+pub fn adapt_window_to_monitor(window: &tauri::WebviewWindow) {
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let Some(monitor) = monitor else {
+        return;
+    };
+    let work = monitor.work_area().size;
+    let side = compute_square_physical_side(work.width, work.height, monitor.scale_factor());
+    let desired = tauri::PhysicalSize::new(side, side);
+    if window
+        .inner_size()
+        .map(|cur| cur.width != side || cur.height != side)
+        .unwrap_or(true)
+    {
+        let _ = window.set_size(tauri::Size::Physical(desired));
+    }
+}
+
+pub fn configure_borderless_dwm(window: &tauri::WebviewWindow, theme: ThemeMode) {
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let raw_hwnd = hwnd.0;
+    let corner_pref = DWMWCP_ROUND;
+    let border_none = DWMWA_COLOR_NONE;
+    let is_dark = match theme {
+        ThemeMode::Dark => true,
+        ThemeMode::Light => false,
+        ThemeMode::System => matches!(window.theme(), Ok(tauri::Theme::Dark)),
+    };
+    let caption_color = if is_dark {
+        DARK_TOPBAR_COLORREF
+    } else {
+        LIGHT_TOPBAR_COLORREF
+    };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            raw_hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as _,
+            (&raw const corner_pref).cast(),
+            std::mem::size_of_val(&corner_pref) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            raw_hwnd,
+            DWMWA_BORDER_COLOR as _,
+            (&raw const border_none).cast(),
+            std::mem::size_of_val(&border_none) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            raw_hwnd,
+            DWMWA_CAPTION_COLOR as _,
+            (&raw const caption_color).cast(),
+            std::mem::size_of_val(&caption_color) as u32,
+        );
+    }
+}
+
+pub fn apply_window_theme(app: &AppHandle, theme: ThemeMode) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_theme(theme.to_tauri_theme());
+        configure_borderless_dwm(&window, theme);
+    }
+}
+
+fn current_theme_mode(app: &AppHandle) -> ThemeMode {
+    app.try_state::<Shell>()
+        .map(|s| s.theme_mode())
+        .unwrap_or_default()
+}
+
 pub fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let theme = current_theme_mode(app);
+        adapt_window_to_monitor(&window);
+        configure_borderless_dwm(&window, theme);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+pub fn minimize_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.minimize();
+    }
+}
+
+pub fn start_dragging(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.start_dragging();
     }
 }
 
@@ -825,6 +1062,9 @@ pub fn toggle_window(app: &AppHandle) {
     if visible && !minimized && focused {
         let _ = window.hide();
     } else {
+        let theme = current_theme_mode(app);
+        adapt_window_to_monitor(&window);
+        configure_borderless_dwm(&window, theme);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -861,6 +1101,7 @@ pub struct Shell {
     chinese: bool,
     hotkey_worker: HotkeyWorker,
     hotkey_state: Mutex<(Option<String>, HotkeyStatus)>,
+    prefs: Mutex<UiPrefs>,
     show_item: MenuItem<Wry>,
     autostart_item: CheckMenuItem<Wry>,
     tray: TrayIcon<Wry>,
@@ -876,6 +1117,11 @@ impl Shell {
             .unwrap_or_else(|_| env::temp_dir().join("org.ag-account-switcher.lite"));
         let chinese = is_chinese_locale();
         let config = load_shell_config(&data_root);
+        let initial_prefs = UiPrefs {
+            layout: config.layout,
+            theme: config.theme,
+            particles_follow: config.particles_follow,
+        };
         let parsed_shortcut = config
             .hotkey
             .as_deref()
@@ -967,6 +1213,11 @@ impl Shell {
         }
         let tray = builder.build(app)?;
 
+        apply_window_theme(app, initial_prefs.theme);
+        if let Some(window) = app.get_webview_window("main") {
+            adapt_window_to_monitor(&window);
+            let _ = window.center();
+        }
         if !start_hidden {
             show_window(app);
         }
@@ -976,6 +1227,7 @@ impl Shell {
             chinese,
             hotkey_worker,
             hotkey_state: Mutex::new((initial_label, initial_status)),
+            prefs: Mutex::new(initial_prefs),
             show_item,
             autostart_item,
             tray,
@@ -997,6 +1249,10 @@ impl Shell {
         self.quitting.load(Ordering::SeqCst)
     }
 
+    pub fn theme_mode(&self) -> ThemeMode {
+        self.prefs.lock().unwrap_or_else(|e| e.into_inner()).theme
+    }
+
     fn prepare_quit(&self) {
         self.quitting.store(true, Ordering::SeqCst);
         self.hotkey_worker.shutdown();
@@ -1015,11 +1271,15 @@ impl Shell {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let prefs = *self.prefs.lock().unwrap_or_else(|e| e.into_inner());
         ShellStatus {
             autostart,
             autostart_blocked,
             hotkey,
             hotkey_status: status.as_str(),
+            layout: prefs.layout.as_str(),
+            theme: prefs.theme.as_str(),
+            particles_follow: prefs.particles_follow,
         }
     }
 
@@ -1043,7 +1303,8 @@ impl Shell {
         };
         let next_status = self.hotkey_worker.apply(parsed)?;
         let canonical = parsed.map(Shortcut::canonical);
-        save_shell_config(&self.data_root, canonical.as_deref())?;
+        let prefs = *self.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        save_shell_config(&self.data_root, canonical.as_deref(), prefs)?;
 
         {
             let mut guard = self.hotkey_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1056,6 +1317,33 @@ impl Shell {
             .tray
             .set_tooltip(Some(format_tooltip(self.chinese, canonical.as_deref())));
 
+        Ok(self.status())
+    }
+
+    pub fn set_preferences(
+        &self,
+        app: &AppHandle,
+        layout: LayoutMode,
+        theme: ThemeMode,
+        particles_follow: bool,
+    ) -> Result<ShellStatus, &'static str> {
+        let next_prefs = UiPrefs {
+            layout,
+            theme,
+            particles_follow,
+        };
+        let hotkey = self
+            .hotkey_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone();
+        save_shell_config(&self.data_root, hotkey.as_deref(), next_prefs)?;
+        {
+            let mut guard = self.prefs.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = next_prefs;
+        }
+        apply_window_theme(app, theme);
         Ok(self.status())
     }
 
@@ -1242,19 +1530,42 @@ mod tests {
     #[test]
     fn shell_config_round_trips_and_recovers_from_corruption() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(
-            load_shell_config(temp.path()).hotkey.as_deref(),
-            Some(DEFAULT_HOTKEY)
-        );
+        let initial = load_shell_config(temp.path());
+        assert_eq!(initial.hotkey.as_deref(), Some(DEFAULT_HOTKEY));
+        assert_eq!(initial.layout, LayoutMode::Matrix);
+        assert_eq!(initial.theme, ThemeMode::System);
+        assert!(initial.particles_follow);
 
-        save_shell_config(temp.path(), Some("Ctrl+Alt+S")).unwrap();
-        assert_eq!(
-            load_shell_config(temp.path()).hotkey.as_deref(),
-            Some("Ctrl+Alt+S")
-        );
+        let custom_prefs = UiPrefs {
+            layout: LayoutMode::List,
+            theme: ThemeMode::Dark,
+            particles_follow: false,
+        };
+        save_shell_config(temp.path(), Some("Ctrl+Alt+S"), custom_prefs).unwrap();
+        let loaded = load_shell_config(temp.path());
+        assert_eq!(loaded.hotkey.as_deref(), Some("Ctrl+Alt+S"));
+        assert_eq!(loaded.layout, LayoutMode::List);
+        assert_eq!(loaded.theme, ThemeMode::Dark);
+        assert!(!loaded.particles_follow);
 
-        save_shell_config(temp.path(), None).unwrap();
-        assert_eq!(load_shell_config(temp.path()).hotkey, None);
+        save_shell_config(temp.path(), None, UiPrefs::default()).unwrap();
+        let disabled = load_shell_config(temp.path());
+        assert_eq!(disabled.hotkey, None);
+        assert_eq!(disabled.layout, LayoutMode::Matrix);
+        assert_eq!(disabled.theme, ThemeMode::System);
+        assert!(disabled.particles_follow);
+
+        // Legacy v0.1.x config with only `hotkey` preserves the shortcut and applies UI defaults.
+        fs::write(
+            temp.path().join(SHELL_CONFIG_FILE),
+            r#"{"hotkey":"Ctrl+Shift+A"}"#,
+        )
+        .unwrap();
+        let legacy = load_shell_config(temp.path());
+        assert_eq!(legacy.hotkey.as_deref(), Some("Ctrl+Shift+A"));
+        assert_eq!(legacy.layout, LayoutMode::Matrix);
+        assert_eq!(legacy.theme, ThemeMode::System);
+        assert!(legacy.particles_follow);
 
         fs::write(temp.path().join(SHELL_CONFIG_FILE), "{broken-json").unwrap();
         assert_eq!(
@@ -1264,13 +1575,40 @@ mod tests {
 
         fs::write(
             temp.path().join(SHELL_CONFIG_FILE),
-            r#"{"hotkey":"Ctrl+C"}"#,
+            r#"{"hotkey":"Ctrl+C","layout":"unknown","theme":"neon"}"#,
         )
         .unwrap();
-        assert_eq!(
-            load_shell_config(temp.path()).hotkey.as_deref(),
-            Some(DEFAULT_HOTKEY)
-        );
+        let sanitized = load_shell_config(temp.path());
+        assert_eq!(sanitized.hotkey.as_deref(), Some(DEFAULT_HOTKEY));
+        assert_eq!(sanitized.layout, LayoutMode::Matrix);
+        assert_eq!(sanitized.theme, ThemeMode::System);
+
+        assert_eq!(LayoutMode::parse(" LIST "), Ok(LayoutMode::List));
+        assert_eq!(LayoutMode::parse("matrix"), Ok(LayoutMode::Matrix));
+        assert_eq!(LayoutMode::parse("grid"), Err("invalid_preferences"));
+        assert_eq!(ThemeMode::parse("Light"), Ok(ThemeMode::Light));
+        assert_eq!(ThemeMode::parse("dark"), Ok(ThemeMode::Dark));
+        assert_eq!(ThemeMode::parse("system"), Ok(ThemeMode::System));
+        assert_eq!(ThemeMode::parse("sepia"), Err("invalid_preferences"));
+
+        // 1:1 square monitor & DPI adaptation invariants across 1080p, 1440p, and 4K.
+        for (w, h, scale) in [
+            (1920, 1032, 1.0),
+            (1920, 1032, 1.25),
+            (1920, 1008, 1.5),
+            (2560, 1380, 1.5),
+            (3840, 2100, 1.5),
+            (3840, 2100, 2.0),
+            (1366, 720, 1.0),
+        ] {
+            let side = compute_square_physical_side(w, h, scale);
+            assert_eq!(side % 2, 0, "physical side must be an even integer");
+            assert!(
+                side <= w.min(h),
+                "square side {side} must fit inside {w}x{h}"
+            );
+        }
+        assert_eq!(compute_square_physical_side(2560, 1380, 1.5), 758);
     }
 
     #[test]

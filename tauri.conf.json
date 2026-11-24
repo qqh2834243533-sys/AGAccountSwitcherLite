@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AG Account Switcher Lite",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "identifier": "org.ag-account-switcher.lite",
   "build": { "frontendDist": "ui" },
   "app": {
@@ -10,10 +10,12 @@
       "label": "main",
       "title": "AG Account Switcher Lite",
       "visible": false,
-      "width": 520,
-      "height": 585,
-      "minWidth": 420,
-      "minHeight": 520
+      "decorations": false,
+      "shadow": false,
+      "resizable": false,
+      "maximizable": false,
+      "width": 504,
+      "height": 504
     }],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost"
