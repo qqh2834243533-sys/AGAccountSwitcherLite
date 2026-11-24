@@ -10,6 +10,7 @@ const strings = {
   cancel: ["取消", "Cancel"],
   yes: ["确认", "Confirm"],
   remove: ["移除", "Remove"],
+  updateCredential: ["更新凭据", "Update credential"],
   alias: ["账号名称", "Account label"],
   activeBadge: ["当前", "Active"],
   autostartLabel: ["开机自启", "Launch at startup"],
@@ -48,6 +49,10 @@ const strings = {
     "检测到当前已登录未保存账号，可直接点击「登记当前账号」。",
     "An unsaved account is signed in. Click “Save current account” to register it."
   ],
+  unmatchedStatus: [
+    "当前凭据未匹配已保存账号。如果是原账号，请核对后更新相应槽位。",
+    "The current credential matches no saved account. If you recognize the account, verify it and update its slot."
+  ],
   guidance: [
     "首次在官方 Antigravity 登录后，在此登记当前账号（最多四个）。热键可随时唤出或收起窗口（窗口内按 Esc 亦可收起回托盘，真正退出请使用托盘右键菜单）。客户端运行时切换会先请求确认并发送关闭信号；若窗口未关闭则安全中止。",
     "Sign in through official Antigravity first, then save up to four accounts here. Use the global shortcut to summon or hide this window (Esc also hides to tray; use the tray menu to quit). Running switches ask for confirmation first and abort safely if any window stays open."
@@ -56,14 +61,23 @@ const strings = {
     "已打开 Antigravity。请在原生 App 核对账号。若出现登录页，请用官方流程重新登录。",
     "Antigravity opened. Check the account in the App. If sign-in is requested, use the official sign-in flow."
   ],
+  opened_unmatched: [
+    "Antigravity 已打开，但本地凭据未能确认目标账号。请在原生 App 核对账号。",
+    "Antigravity opened, but the local credential could not confirm the target account. Check the account in the App."
+  ],
   restored: [
     "已恢复切换前的本地状态。请打开原生 App 核对账号。",
     "Previous local state restored. Open Antigravity to check the account."
   ],
   saved: ["已保存当前账号。", "Current account saved."],
+  credentialUpdated: ["已更新槽位凭据。", "Saved credential updated."],
   removed: ["已移除该保存项。", "Saved account removed."],
   cleared: ["已清除恢复记录。", "Recovery record cleared."],
   removePrompt: ["移除这个已保存的账号？", "Remove this saved account?"],
+  updateCredentialPrompt: [
+    "请先在 Antigravity 确认当前登录的是「{account}」并完全退出。确认用当前凭据更新该槽位？",
+    "Verify in Antigravity that you are signed in as “{account}”, then quit it completely. Update this slot with the current credential?"
+  ],
   forgetPrompt: ["清除本工具保存的恢复记录？", "Clear this app’s recovery record?"],
   switchRunningPrompt: [
     "Antigravity 正在运行。请确认没有正在执行的 Agent 且已保存工作，继续切换并重启客户端？",
@@ -97,6 +111,7 @@ const strings = {
   invalid_label: ["请输入最长 48 字的账号名称。", "Enter an account label up to 48 characters."],
   slots_full: ["最多只能保存四个账号。", "Up to four accounts can be saved."],
   already_registered: ["已保存此会话，或账号名称已使用。", "This session or account label is already saved."],
+  different_account: ["当前凭据与该槽位属于不同账号。", "The current credential and the slot belong to different accounts."],
   active_changed: [
     "原生账号状态已被外部修改。已保留当前状态，请核对 App 中的账号。",
     "The active session changed externally. It was left intact. Check the account in Antigravity."
@@ -106,7 +121,12 @@ const strings = {
   switch_unverified: ["无法确认凭据写入。切换前的状态已自动恢复。", "The switch could not be verified. The previous state was restored."],
   restore_unverified: ["无法确认恢复结果。已停止操作。", "Recovery could not be verified."],
   recovery_required: ["上次切换尚未完成。退出原生 App 后，请先恢复会话。", "The previous switch is incomplete. Quit Antigravity and restore the previous session."],
+  recovery_unmatched: [
+    "当前凭据无法匹配上次的目标账号。请核对原生 App，完全退出后可选择清除恢复记录。",
+    "The current credential could not be matched to the previous target. Check Antigravity, then quit it completely to clear the recovery record."
+  ],
   restore_before_discard: ["请先恢复切换前的会话。", "Restore the previous session first."],
+  clear_recovery_before_update: ["此槽位关联了恢复记录。请先处理该记录，再更新凭据。", "This slot has a recovery record. Resolve it before updating the credential."],
   no_recovery: ["当前没有恢复记录。", "There is no recovery record."],
   journal_invalid: ["无法读取恢复记录。切换已停止。", "The recovery record could not be read. Switching stopped."],
   switch_in_progress: ["另一个账号操作尚未完成。", "An account operation is already in progress."],
@@ -193,7 +213,7 @@ async function requestSwitch(slot) {
     return;
   }
   if (current.recovery === "pending") {
-    notice("recovery_required", true);
+    notice(current.canRestore ? "recovery_required" : "recovery_unmatched", true);
     return;
   }
   if (current.clientRunning) {
@@ -245,7 +265,18 @@ function render() {
     remove.setAttribute("aria-label", t("remove") + " " + label);
     open.disabled = working || recording || needsRecovery || !current.appInstalled;
     remove.disabled = working || recording || needsRecovery;
-    row.append(open, remove);
+    row.append(open);
+    if (current.unregisteredActive && current.appInstalled && !needsRecovery) {
+      const update = button(t("updateCredential"), "compact", async () => {
+        if (await confirmAction("updateCredentialPrompt", label)) {
+          await operate("update_saved_account", { slot }, "credentialUpdated");
+        }
+      });
+      update.setAttribute("aria-label", t("updateCredential") + " " + label);
+      update.disabled = working || recording;
+      row.append(update);
+    }
+    row.append(remove);
     list.append(row);
   }
   byId("count").hidden = !current;
@@ -257,7 +288,7 @@ function render() {
   byId("label").disabled = working;
   byId("cancel-registration").disabled = working;
   for (const id of ["restore", "forget"]) {
-    byId(id).hidden = !current?.recovery;
+    byId(id).hidden = id === "restore" ? !current?.canRestore : !current?.recovery;
     byId(id).disabled = working || recording;
   }
   byId("reload").hidden = Boolean(current);
@@ -290,9 +321,9 @@ function render() {
   clearBtn.disabled = working || !current;
 }
 
-function confirmAction(key) {
+function confirmAction(key, accountLabel = "") {
   const dialog = byId("confirm");
-  byId("confirm-text").textContent = t(key);
+  byId("confirm-text").textContent = t(key).replace("{account}", () => accountLabel);
   dialog.returnValue = "cancel";
   dialog.showModal();
   return new Promise(resolve => {
@@ -315,10 +346,10 @@ function applyShellStatus(shell) {
 function showStatus() {
   if (!current) return;
   if (!current.appInstalled) notice("app_missing", true);
-  else if (current.recovery === "pending") notice("recovery_required", true);
+  else if (current.recovery === "pending") notice(current.canRestore ? "recovery_required" : "recovery_unmatched", true);
   else if (current.hotkeyStatus === "conflict") notice("hotkey_conflict", true);
   else if (current.autostart && current.autostartBlocked) notice("autostartBlockedNotice", true);
-  else if (current.unregisteredActive && current.accounts.length < 4) notice("unregisteredStatus");
+  else if (current.unregisteredActive) notice(current.accounts.length ? "unmatchedStatus" : "unregisteredStatus");
   else if (current.clientRunning) notice("runningStatus");
   else notice(current.accounts.length ? "ready" : "empty");
 }
@@ -335,10 +366,18 @@ async function operate(command, arguments_, success) {
       byId("label").value = "";
     }
     await load();
-    notice(success);
+    if (command === "switch_account" && current.activeSlot !== arguments_.slot) {
+      notice("opened_unmatched", true);
+    } else {
+      notice(success);
+    }
   } catch (error) {
     try { await load(); } catch { current = undefined; }
-    notice(typeof error === "string" ? error : "operation_failed", true);
+    if (error === "recovery_required" && current?.recovery === "pending" && !current.canRestore) {
+      notice("recovery_unmatched", true);
+    } else {
+      notice(typeof error === "string" ? error : "operation_failed", true);
+    }
   } finally {
     working = false;
     render();

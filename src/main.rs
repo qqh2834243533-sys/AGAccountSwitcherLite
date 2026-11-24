@@ -83,6 +83,14 @@ async fn register_account(app: AppHandle, label: String) -> Reply<()> {
 }
 
 #[tauri::command]
+async fn update_saved_account(app: AppHandle, slot: u8) -> Reply<()> {
+    with_vault(app, true, move |vault, _root| {
+        service::update_saved_account(vault, slot, client::require_closed)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn remove_account(app: AppHandle, slot: u8) -> Reply<()> {
     with_vault(app, true, move |vault, _root| service::remove(vault, slot)).await
 }
@@ -184,6 +192,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             overview,
             register_account,
+            update_saved_account,
             remove_account,
             switch_account,
             restore_session,

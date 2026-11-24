@@ -24,10 +24,9 @@ pub struct Credential {
     pub comment: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum SessionIdentity {
-    Sub(Zeroizing<String>),
-    RefreshToken(Zeroizing<String>),
+struct SessionIdentity {
+    subject: Option<Zeroizing<String>>,
+    refresh_token: Option<Zeroizing<String>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -79,8 +78,7 @@ impl Credential {
         self.secret.as_slice() == other.secret.as_slice() && self.user == other.user
     }
 
-    /// Match two credentials that belong to the same Google account even after
-    /// Antigravity refreshes `access_token` / `expiry` in the background.
+    /// Match by Google subject when both are present, or by an unchanged refresh token.
     /// Falls back to exact byte equality when the payload is opaque or unknown.
     pub fn same_account(&self, other: &Self) -> bool {
         if self.same_session(other) {
@@ -89,10 +87,19 @@ impl Credential {
         if self.user != other.user {
             return false;
         }
-        match (self.identity(), other.identity()) {
+        let (Some(left), Some(right)) = (self.identity(), other.identity()) else {
+            return false;
+        };
+        match (&left.subject, &right.subject) {
             (Some(left), Some(right)) => left == right,
-            _ => false,
+            _ => left.refresh_token.is_some() && left.refresh_token == right.refresh_token,
         }
+    }
+
+    pub fn has_conflicting_subject(&self, other: &Self) -> bool {
+        let left = self.identity().and_then(|identity| identity.subject);
+        let right = other.identity().and_then(|identity| identity.subject);
+        matches!((left, right), (Some(left), Some(right)) if left != right)
     }
 
     fn identity(&self) -> Option<SessionIdentity> {
@@ -106,23 +113,18 @@ impl Credential {
         };
 
         let parsed: StoredOAuthPayload = serde_json::from_str(json_text).ok()?;
-        if let Some(id_token) = parsed.id_token.as_deref() {
-            if let Some(sub) = extract_jwt_sub(id_token) {
-                return Some(SessionIdentity::Sub(sub));
-            }
-        }
-        if let Some(refresh_token) = parsed
+        let subject = parsed.id_token.as_deref().and_then(extract_jwt_sub);
+        let refresh_token = parsed
             .token
             .as_ref()
             .and_then(|token| token.refresh_token.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-        {
-            return Some(SessionIdentity::RefreshToken(Zeroizing::new(
-                refresh_token.to_owned(),
-            )));
-        }
-        None
+            .map(|value| Zeroizing::new(value.to_owned()));
+        Some(SessionIdentity {
+            subject,
+            refresh_token,
+        })
     }
 }
 
@@ -355,5 +357,13 @@ mod tests {
         let rt_only_v1 = build_cred(false, None, "rt-stable", "at-1");
         let rt_only_v2 = build_cred(true, None, "rt-stable", "at-2");
         assert!(rt_only_v1.same_account(&rt_only_v2));
+
+        let subject_and_rt = build_cred(false, Some("google-uid-1"), "rt-stable", "at-1");
+        let conflicting_sub = build_cred(false, Some("google-uid-2"), "rt-stable", "at-1");
+        let rotated_rt_only = build_cred(false, None, "rt-rotated", "at-2");
+        assert!(subject_and_rt.same_account(&rt_only_v2));
+        assert!(rt_only_v2.same_account(&subject_and_rt));
+        assert!(!subject_and_rt.same_account(&conflicting_sub));
+        assert!(!rt_only_v1.same_account(&rotated_rt_only));
     }
 }

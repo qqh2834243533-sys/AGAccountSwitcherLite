@@ -20,6 +20,7 @@ pub struct Status {
     unregistered_active: bool,
     recovery: Option<&'static str>,
     pending_slot: Option<u8>,
+    can_restore: bool,
 }
 
 struct Journal {
@@ -83,7 +84,17 @@ fn validate_slot(slot: u8) -> Result<()> {
 }
 
 pub fn status(vault: &Vault<'_>) -> Result<Status> {
-    let active = credential_io(vault.active())?.filter(|cred| !cred.secret.is_empty());
+    let active = credential_io(vault.active())?;
+    let mut journal = Journal::read(vault)?;
+    // The caller holds the switch lock. An exact match leaves nothing to roll back.
+    if journal
+        .as_ref()
+        .is_some_and(|entry| entry.pending && entry.previous_matches(active.as_ref()))
+    {
+        credential_io(vault.clear_journal())?;
+        journal = None;
+    }
+    let active = active.filter(|cred| !cred.secret.is_empty());
     let mut accounts = Vec::new();
     let mut matched_slots = Vec::new();
 
@@ -107,7 +118,6 @@ pub fn status(vault: &Vault<'_>) -> Result<Status> {
         _ => (None, false),
     };
 
-    let journal = Journal::read(vault)?;
     Ok(Status {
         accounts,
         active_slot,
@@ -115,6 +125,9 @@ pub fn status(vault: &Vault<'_>) -> Result<Status> {
         recovery: journal
             .as_ref()
             .map(|entry| if entry.pending { "pending" } else { "ready" }),
+        can_restore: journal
+            .as_ref()
+            .is_some_and(|entry| !entry.pending || matched_slots.contains(&entry.slot)),
         pending_slot: journal
             .filter(|entry| entry.pending)
             .map(|entry| entry.slot),
@@ -149,6 +162,36 @@ pub fn register(vault: &Vault<'_>, label: String) -> Result<()> {
     credential_io(vault.save(slot, &active, label))
 }
 
+pub fn update_saved_account(
+    vault: &Vault<'_>,
+    slot: u8,
+    closed: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    validate_slot(slot)?;
+    if let Some(journal) = Journal::read(vault)? {
+        if journal.pending {
+            return Err("recovery_required");
+        }
+        if journal.slot == slot {
+            return Err("clear_recovery_before_update");
+        }
+    }
+    closed()?;
+    let saved = credential_io(vault.slot(slot))?.ok_or("account_missing")?;
+    let active = credential_io(vault.active())?
+        .filter(|entry| !entry.secret.is_empty())
+        .ok_or("official_login_required")?;
+    if saved.has_conflicting_subject(&active) {
+        return Err("different_account");
+    }
+    for other in SLOTS.filter(|&other| other != slot) {
+        if credential_io(vault.slot(other))?.is_some_and(|entry| entry.same_account(&active)) {
+            return Err("already_registered");
+        }
+    }
+    credential_io(vault.save(slot, &active, &saved.comment))
+}
+
 pub fn remove(vault: &Vault<'_>, slot: u8) -> Result<()> {
     validate_slot(slot)?;
     let journal = Journal::read(vault)?;
@@ -164,9 +207,7 @@ pub fn remove(vault: &Vault<'_>, slot: u8) -> Result<()> {
     Ok(())
 }
 
-/// If the current active credential uniquely matches a saved slot by stable
-/// account identity (e.g. JWT `sub` or `refresh_token`) and has fresher bytes
-/// from an official background token refresh, write it back to that slot.
+/// Copy the active credential back when it uniquely matches a saved slot.
 /// Never overwrites any slot when the active credential belongs to an unknown
 /// external account or matches multiple slots ambiguously.
 fn sync_refreshed_slot(vault: &Vault<'_>, active: &Credential) -> Result<()> {
@@ -294,9 +335,10 @@ pub fn discard_recovery(vault: &Vault<'_>, closed: impl Fn() -> Result<()>) -> R
     if journal.pending {
         closed()?;
         let active = credential_io(vault.active())?;
-        let target = credential_io(vault.slot(journal.slot))?.ok_or("journal_invalid")?;
         if !journal.previous_matches(active.as_ref())
-            && active.is_some_and(|entry| entry.same_account(&target))
+            && credential_io(vault.slot(journal.slot))?
+                .zip(active)
+                .is_some_and(|(target, entry)| entry.same_account(&target))
         {
             return Err("restore_before_discard");
         }
@@ -416,6 +458,46 @@ mod tests {
     }
 
     #[test]
+    fn overview_clears_pending_when_the_previous_state_is_intact() {
+        let fixture = Fixture::new();
+        let vault = fixture.vault();
+        let previous = fake_session(1);
+
+        vault.save_journal(&previous, "p0:2").unwrap();
+        assert!(status(&vault).unwrap().recovery.is_none());
+        assert!(vault.journal().unwrap().is_none());
+        assert!(vault.active().unwrap().is_none());
+
+        vault.update_active(&previous).unwrap();
+        vault.save_journal(&previous, "p1:2").unwrap();
+        assert!(status(&vault).unwrap().recovery.is_none());
+        assert!(vault.journal().unwrap().is_none());
+        assert!(matches(&vault, 1));
+
+        vault.save_journal(&previous, "r1:2").unwrap();
+        assert_eq!(status(&vault).unwrap().recovery, Some("ready"));
+    }
+
+    #[test]
+    fn overview_keeps_pending_after_target_write_and_discard_requires_restore() {
+        let fixture = Fixture::new();
+        let vault = fixture.vault();
+        vault.save_journal(&fake_session(1), "p1:2").unwrap();
+        vault.save(2, &fake_session(2), "Target").unwrap();
+        vault.update_active(&fake_session(2)).unwrap();
+
+        let snapshot = status(&vault).unwrap();
+        assert_eq!(snapshot.recovery, Some("pending"));
+        assert!(snapshot.can_restore);
+        assert_eq!(
+            discard_recovery(&vault, || Ok(())),
+            Err("restore_before_discard")
+        );
+        restore(&vault, || Ok(())).unwrap();
+        assert!(matches(&vault, 1));
+    }
+
+    #[test]
     fn external_login_during_recovery_is_preserved() {
         let fixture = Fixture::new();
         let vault = fixture.vault();
@@ -434,9 +516,23 @@ mod tests {
         assert_eq!(result, Err("recovery_required"));
         assert_eq!(restore(&vault, || Ok(())), Err("active_changed"));
         assert!(matches(&vault, 3));
-        assert_eq!(status(&vault).unwrap().pending_slot, Some(1));
+        let snapshot = status(&vault).unwrap();
+        assert_eq!(snapshot.pending_slot, Some(1));
+        assert!(!snapshot.can_restore);
         discard_recovery(&vault, || Ok(())).unwrap();
         assert!(matches(&vault, 3));
+    }
+
+    #[test]
+    fn missing_recovery_target_can_be_explicitly_discarded() {
+        let fixture = Fixture::new();
+        let vault = fixture.vault();
+        vault.save_journal(&fake_session(1), "p1:2").unwrap();
+        vault.update_active(&fake_session(2)).unwrap();
+        assert!(!status(&vault).unwrap().can_restore);
+        discard_recovery(&vault, || Ok(())).unwrap();
+        assert!(vault.journal().unwrap().is_none());
+        assert!(matches(&vault, 2));
     }
 
     #[test]
@@ -508,6 +604,58 @@ mod tests {
             user: "antigravity".into(),
             comment: String::new(),
         }
+    }
+
+    #[test]
+    fn confirmed_update_replaces_an_unmatched_credential_in_its_existing_slot() {
+        let fixture = Fixture::new();
+        let vault = fixture.vault();
+        let original = oauth_session(None, "rt-1", "at-1");
+        let rotated = oauth_session(None, "rt-2", "at-2");
+        vault.save(3, &original, "Work").unwrap();
+        vault.update_active(&rotated).unwrap();
+        assert!(status(&vault).unwrap().unregistered_active);
+        assert_eq!(
+            update_saved_account(&vault, 3, || Err("client_running")),
+            Err("client_running")
+        );
+        assert!(vault.slot(3).unwrap().unwrap().same_session(&original));
+
+        update_saved_account(&vault, 3, || Ok(())).unwrap();
+        let saved = vault.slot(3).unwrap().unwrap();
+        assert_eq!(saved.comment, "Work");
+        assert!(saved.same_session(&rotated));
+        assert!(vault.active().unwrap().unwrap().same_session(&rotated));
+        assert_eq!(status(&vault).unwrap().active_slot, Some(3));
+    }
+
+    #[test]
+    fn confirmed_update_rejects_conflicts_and_a_linked_recovery_record() {
+        let fixture = Fixture::new();
+        let vault = fixture.vault();
+        let original = oauth_session(Some("sub-1"), "rt-1", "at-1");
+        let other = oauth_session(Some("sub-2"), "rt-2", "at-2");
+        vault.save(1, &original, "First").unwrap();
+        vault.update_active(&other).unwrap();
+        assert_eq!(
+            update_saved_account(&vault, 1, || Ok(())),
+            Err("different_account")
+        );
+
+        vault.save(2, &other, "Second").unwrap();
+        let unknown_subject = oauth_session(None, "rt-2", "at-3");
+        vault.update_active(&unknown_subject).unwrap();
+        assert_eq!(
+            update_saved_account(&vault, 1, || Ok(())),
+            Err("already_registered")
+        );
+
+        vault.save_journal(&original, "r1:1").unwrap();
+        assert_eq!(
+            update_saved_account(&vault, 1, || Ok(())),
+            Err("clear_recovery_before_update")
+        );
+        assert!(vault.slot(1).unwrap().unwrap().same_session(&original));
     }
 
     #[test]
