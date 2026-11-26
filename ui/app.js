@@ -43,6 +43,14 @@ const strings = {
   updateCredential: ["更新", "Update"],
   alias: ["输入备注名称（最长 48 字）", "Account label (up to 48 chars)"],
   activeMatrix: ["● 当前激活会话", "● Active session"],
+  quotaSnapshot: ["上次额度", "Last quota"],
+  quotaFiveHours: ["5 小时", "5h"],
+  quotaWeekly: ["周", "Week"],
+  quotaEstimatedFull: ["100%（推算）", "100% est."],
+  quotaUnknownReset: ["重置时间未知", "Reset time unknown"],
+  quotaResetElapsed: ["已过重置时间", "Reset time passed"],
+  quotaResetsIn: ["距重置 {time}", "Resets in {time}"],
+  quotaNoData: ["暂无记录", "No observation"],
   idleMatrix: ["点击安全切入", "Click to switch"],
   activePill: ["当前 · #{slot}", "Active · #{slot}"],
   emptyTitle: ["空闲槽位 #{slot}", "Empty slot #{slot}"],
@@ -108,6 +116,10 @@ const strings = {
     "Antigravity 正在运行。请确认没有正在执行的 Agent 且已保存工作，继续切换并重启客户端？",
     "Antigravity is running. Confirm no agents are active and your work is saved before switching and restarting?"
   ],
+  switchKnownSourcePrompt: [
+    "请确认「{account}」是 Antigravity 当前槽位，且 Agent 已空闲、工作已保存。切换前会尝试为该槽位记录额度。继续？",
+    "Confirm that “{account}” is the current Antigravity slot, agents are idle, and your work is saved. The app will try to record quota for this slot before switching. Continue?"
+  ],
   reopenSameRunningPrompt: [
     "此账号已是当前活动账号，且 Antigravity 正在运行。仍要重启客户端吗？",
     "This account is already active and Antigravity is running. Restart the app anyway?"
@@ -121,6 +133,22 @@ const strings = {
   close_failed: [
     "未能向 Antigravity 发送关闭请求，账号未修改。请保存工作并手动退出 App 后重试。",
     "Could not request Antigravity to close. The account was left intact. Save your work, quit the app, and retry."
+  ],
+  close_process_gone: [
+    "关闭前 Antigravity 进程发生变化，切换已中止。请等客户端稳定后重试。",
+    "Antigravity processes changed before closing. Try again once the app has settled."
+  ],
+  close_process_access_denied: [
+    "Windows 拒绝访问 Antigravity 进程。请从应用内正常退出后重试。",
+    "Windows denied access to an Antigravity process. Quit Antigravity normally and retry."
+  ],
+  close_message_denied: [
+    "Windows 拒绝向 Antigravity 窗口发送关闭请求。请从应用内正常退出后重试。",
+    "Windows blocked the close request to an Antigravity window. Quit Antigravity normally and retry."
+  ],
+  close_cleanup_failed: [
+    "Antigravity 窗口已关闭，但后台进程尚未退出。请从应用内正常退出后重试。",
+    "Antigravity’s windows closed, but a background process is still running. Quit Antigravity normally and retry."
   ],
   close_timeout: [
     "窗口未在限定时间内关闭（可能存在未保存更改提示），切换已安全中止且账号未修改。",
@@ -159,6 +187,8 @@ const strings = {
   data_folder_unavailable: ["无法访问本工具的本地目录。", "The app’s local folder is unavailable."],
   lock_unavailable: ["无法锁定切换操作。", "Could not lock the account operation."],
   operation_failed: ["操作没有完成。请重试。", "The operation did not complete. Try again."],
+  switchedWithoutQuota: ["已切换，本次未能保存额度快照。", "Switched. No quota snapshot was saved."],
+  switchedQuotaSourceChanged: ["已切换。无法确认切出的槽位，已跳过额度快照。", "Switched. The quota snapshot was skipped because the outgoing slot could not be confirmed."],
 };
 
 const CODE_KEY_MAP = {
@@ -627,14 +657,18 @@ async function requestSwitch(slot) {
       setNotice("account_missing", "error");
       return;
     }
+    let confirmedSourceSlot = null;
     if (current.clientRunning) {
-      const promptKey = current.activeSlot === slot ? "reopenSameRunningPrompt" : "switchRunningPrompt";
-      if (!(await confirmAction(promptKey))) {
+      const source = current.accounts.find(account => account.slot === current.activeSlot && account.slot !== slot);
+      const promptKey = current.activeSlot === slot ? "reopenSameRunningPrompt"
+        : source ? "switchKnownSourcePrompt" : "switchRunningPrompt";
+      if (!(await confirmAction(promptKey, source?.label))) {
         transientNotice = null;
         return;
       }
+      confirmedSourceSlot = source?.slot ?? null;
     }
-    await operate("switch_account", { slot }, "opened");
+    await operate("switch_account", { slot, confirmedSourceSlot }, "opened");
   } catch (error) {
     setNotice(typeof error === "string" ? error : "operation_failed", "error");
   } finally {
@@ -693,12 +727,213 @@ function createAuxActions(slot, label, needsRecovery) {
   return wrap;
 }
 
+const quotaClocks = [];
+const quotaTooltip = byId("quota-tooltip");
+let quotaTimer;
+let quotaTooltipCloseTimer;
+let openQuotaTooltip;
+
+function quotaValue(bucket, now) {
+  if (!bucket) return { fraction: null, percent: "—", reset: t("quotaNoData") };
+  if (bucket.resetAt != null && bucket.resetAt <= now) {
+    return { fraction: 1, percent: t("quotaEstimatedFull"), reset: t("quotaResetElapsed") };
+  }
+  const fraction = bucket.remainingFraction;
+  return {
+    fraction,
+    percent: fraction == null ? "—" : `${Math.round(fraction * 1000) / 10}%`,
+    reset: bucket.resetAt == null
+      ? t("quotaUnknownReset")
+      : t("quotaResetsIn").replace("{time}", quotaDuration(bucket.resetAt - now))
+  };
+}
+
+function quotaDuration(milliseconds) {
+  const seconds = Math.ceil(milliseconds / 1000);
+  if (seconds < 60) return chinese ? `${seconds} 秒` : `${seconds}s`;
+  const minutes = Math.ceil(seconds / 60);
+  const units = [
+    [Math.floor(minutes / 1440), " 天", "d"],
+    [Math.floor(minutes / 60) % 24, " 小时", "h"],
+    [minutes % 60, " 分", "m"]
+  ];
+  return units.filter(([value]) => value > 0)
+    .map(([value, zh, en]) => `${value}${chinese ? zh : en}`).join(" ");
+}
+
+function positionQuotaTooltip() {
+  if (!openQuotaTooltip) return;
+  const anchor = openQuotaTooltip.summary.getBoundingClientRect();
+  const { width, height } = quotaTooltip.getBoundingClientRect();
+  const edge = 8;
+  const right = anchor.right + edge;
+  const left = anchor.left - width - edge;
+  const beside = left >= edge || right + width <= window.innerWidth - edge;
+  const x = left >= edge ? left : beside ? right
+    : Math.max(edge, Math.min(anchor.right - width, window.innerWidth - width - edge));
+  const above = anchor.top - height - edge;
+  const preferredY = beside ? anchor.top + (anchor.height - height) / 2
+    : above >= edge ? above : anchor.bottom + edge;
+  const y = Math.max(edge, Math.min(
+    preferredY, window.innerHeight - height - edge
+  ));
+  quotaTooltip.style.left = `${Math.round(x)}px`;
+  quotaTooltip.style.top = `${Math.round(y)}px`;
+}
+
+function hideQuotaTooltip() {
+  clearTimeout(quotaTooltipCloseTimer);
+  openQuotaTooltip?.button.removeAttribute("aria-describedby");
+  openQuotaTooltip = undefined;
+  quotaTooltip.hidden = true;
+}
+
+function scheduleQuotaTooltipClose() {
+  clearTimeout(quotaTooltipCloseTimer);
+  quotaTooltipCloseTimer = setTimeout(() => {
+    if (!openQuotaTooltip?.button.matches(":focus-visible")
+        && !openQuotaTooltip?.summary.matches(":hover") && !quotaTooltip.matches(":hover")) {
+      hideQuotaTooltip();
+    }
+  }, 140);
+}
+
+function showQuotaTooltip(entry) {
+  clearTimeout(quotaTooltipCloseTimer);
+  if (openQuotaTooltip === entry) return;
+  hideQuotaTooltip();
+  openQuotaTooltip = entry;
+  quotaTooltip.replaceChildren();
+  entry.details = [];
+  const stamp = document.createElement("div");
+  stamp.className = "quota-tooltip-stamp";
+  stamp.textContent = `${t("quotaSnapshot")} · ${new Date(entry.capturedAt).toLocaleString()}`;
+  quotaTooltip.append(stamp);
+
+  for (const { name, rows } of entry.groups) {
+    const section = document.createElement("section");
+    section.className = "quota-tooltip-model";
+    const heading = document.createElement("div");
+    heading.className = "quota-tooltip-heading";
+    heading.textContent = name;
+    section.append(heading);
+    for (const { window, label, bucket } of rows) {
+      const row = document.createElement("div");
+      row.className = "quota-tooltip-row";
+      const period = document.createElement("span");
+      period.className = "quota-tooltip-period";
+      period.dataset.window = window;
+      period.textContent = label;
+      const amount = document.createElement("span");
+      amount.className = "quota-tooltip-amount";
+      const reset = document.createElement("span");
+      reset.className = "quota-tooltip-reset";
+      row.append(period, amount, reset);
+      section.append(row);
+      entry.details.push({ bucket, amount, reset });
+    }
+    quotaTooltip.append(section);
+  }
+  entry.button.setAttribute("aria-describedby", quotaTooltip.id);
+  quotaTooltip.hidden = false;
+  updateQuotaClocks();
+  positionQuotaTooltip();
+}
+
+function updateQuotaClocks() {
+  clearTimeout(quotaTimer);
+  const now = Date.now();
+  let nextReset = Infinity;
+  for (const { groups } of quotaClocks) {
+    for (const { rows } of groups) {
+      for (const { bucket, bar } of rows) {
+        if (bucket?.resetAt > now) nextReset = Math.min(nextReset, bucket.resetAt - now);
+        if (!bar) continue;
+        const { fraction } = quotaValue(bucket, now);
+        const level = String(fraction ?? 0);
+        bar.toggleAttribute("data-unavailable", fraction == null);
+        if (bar.style.getPropertyValue("--quota-level") !== level) {
+          bar.style.setProperty("--quota-level", level);
+        }
+      }
+    }
+  }
+  for (const { bucket, amount, reset } of openQuotaTooltip?.details ?? []) {
+    const value = quotaValue(bucket, now);
+    if (amount.textContent !== value.percent) amount.textContent = value.percent;
+    if (reset.textContent !== value.reset) reset.textContent = value.reset;
+  }
+  if (!document.hidden && Number.isFinite(nextReset)) {
+    quotaTimer = setTimeout(updateQuotaClocks, Math.min(nextReset, openQuotaTooltip ? 1000 : 60000));
+  }
+}
+
+function renderQuota(snapshot, button) {
+  const bucketsByGroup = new Map();
+  for (const bucket of snapshot.buckets) {
+    const id = bucket.id.replace(/(?:-wtu)?-(?:5h|weekly)$/, "");
+    if (!bucketsByGroup.has(id)) bucketsByGroup.set(id, new Map());
+    const group = bucketsByGroup.get(id);
+    if (!group.has(bucket.window) || bucket.id === `${id}-${bucket.window}`) {
+      group.set(bucket.window, bucket);
+    }
+  }
+  const pinned = new Map([["gemini", "Gemini"], ["3p", "GPT and Claude"]]);
+  const ordered = [...pinned.keys(), ...[...bucketsByGroup.keys()].filter(id => !pinned.has(id))];
+  const summary = document.createElement("span");
+  summary.className = "quota-bars";
+  summary.setAttribute("aria-hidden", "true");
+  const periods = [["5h", "quotaFiveHours"], ["weekly", "quotaWeekly"]];
+  const groups = ordered.map(id => {
+    const name = pinned.get(id) ?? id;
+    const rows = [];
+    let pair;
+    if (pinned.has(id)) {
+      const label = document.createElement("span");
+      label.className = "quota-bar-label";
+      label.textContent = name;
+      pair = document.createElement("span");
+      pair.className = "quota-bar-pair";
+      summary.append(label, pair);
+    }
+    for (const [window, labelKey] of periods) {
+      const bucket = bucketsByGroup.get(id)?.get(window);
+      let bar;
+      if (pair) {
+        bar = document.createElement("span");
+        bar.className = "quota-bar";
+        bar.dataset.window = window;
+        const fill = document.createElement("span");
+        fill.className = "quota-bar-fill";
+        bar.append(fill);
+        pair.append(bar);
+      }
+      if (bucket || bar) rows.push({ window, label: t(labelKey), bucket, bar });
+    }
+    return { name, rows };
+  });
+  const entry = { summary, button, capturedAt: snapshot.capturedAt, groups };
+  summary.addEventListener("pointerenter", () => showQuotaTooltip(entry));
+  summary.addEventListener("pointerleave", scheduleQuotaTooltipClose);
+  button.addEventListener("focus", () => {
+    if (button.matches(":focus-visible")) showQuotaTooltip(entry);
+  });
+  button.addEventListener("blur", scheduleQuotaTooltipClose);
+  quotaClocks.push(entry);
+  return summary;
+}
+
+quotaTooltip.addEventListener("pointerenter", () => clearTimeout(quotaTooltipCloseTimer));
+quotaTooltip.addEventListener("pointerleave", scheduleQuotaTooltipClose);
+
 function renderSlots() {
   const accounts = current?.accounts ?? [];
   const needsRecovery = current?.recovery === "pending";
   const isMatrix = uiPrefs.layout === "matrix";
   const list = byId("accounts");
+  hideQuotaTooltip();
   list.replaceChildren();
+  quotaClocks.length = 0;
 
   for (let slot = 1; slot <= 4; slot++) {
     const saved = accounts.find(a => a.slot === slot);
@@ -710,6 +945,9 @@ function renderSlots() {
 
     if (saved) {
       const isActive = current?.activeSlot === slot;
+      const quota = !isActive && !switchPending && !needsRecovery && saved.quota
+        ? renderQuota(saved.quota, btn)
+        : null;
       btn.className = isActive ? "slot-trigger is-active" : "slot-trigger";
       if (isActive) btn.setAttribute("aria-current", "true");
       btn.disabled = working || switchPending || recording || needsRecovery || !current?.appInstalled;
@@ -739,7 +977,12 @@ function renderSlots() {
         const arrow = document.createElement("span");
         arrow.textContent = "→";
         sub.append(subText, arrow);
-        bottom.append(name, sub);
+        if (quota) {
+          bottom.classList.add("has-quota");
+          bottom.append(name, quota);
+        } else {
+          bottom.append(name, sub);
+        }
 
         btn.append(top, bottom);
       } else {
@@ -768,6 +1011,7 @@ function renderSlots() {
           badge.textContent = t("activePill").replace("{slot}", String(slot));
           right.append(badge);
         } else {
+          if (quota) right.append(quota);
           const arrow = document.createElement("span");
           arrow.className = "arrow-circle";
           arrow.textContent = "→";
@@ -834,6 +1078,7 @@ function renderSlots() {
 
     list.append(li);
   }
+  updateQuotaClocks();
 }
 
 function render() {
@@ -1001,7 +1246,7 @@ async function operate(command, arguments_, successKey) {
   setNotice("busy", "info");
   render();
   try {
-    await api.invoke(command, arguments_);
+    const result = await api.invoke(command, arguments_);
     if (command === "register_account") {
       registration = false;
       byId("label").value = "";
@@ -1009,6 +1254,10 @@ async function operate(command, arguments_, successKey) {
     await load();
     if (command === "switch_account" && current.activeSlot !== arguments_.slot) {
       setNotice("opened_unmatched", "warn");
+    } else if (command === "switch_account" && result === "sourceSlotChanged") {
+      setNotice("switchedQuotaSourceChanged", "warn");
+    } else if (command === "switch_account" && result === "unavailable") {
+      setNotice("switchedWithoutQuota", "warn");
     } else {
       setNotice(successKey, "info");
     }
@@ -1114,9 +1363,12 @@ window.addEventListener("resize", () => {
   stageW = 0;
   stageH = 0;
   ensureStarburstLoop();
+  positionQuotaTooltip();
 });
 document.addEventListener("visibilitychange", () => {
   ensureStarburstLoop();
+  if (document.hidden) hideQuotaTooltip();
+  updateQuotaClocks();
 });
 
 byId("topbar").addEventListener("mousedown", event => {
@@ -1258,6 +1510,11 @@ document.addEventListener("keydown", event => {
   if (working || switchPending || confirmationPending) return;
 
   if (event.key === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
+    if (openQuotaTooltip) {
+      event.preventDefault();
+      hideQuotaTooltip();
+      return;
+    }
     if (registration) {
       event.preventDefault();
       registration = false;

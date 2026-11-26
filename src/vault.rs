@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::io;
 use std::{ptr, slice};
 use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
@@ -25,8 +26,14 @@ pub struct Credential {
 }
 
 struct SessionIdentity {
-    subject: Option<Zeroizing<String>>,
+    claims: Option<JwtClaims>,
     refresh_token: Option<Zeroizing<String>>,
+}
+
+impl SessionIdentity {
+    fn subject(&self) -> Option<&str> {
+        self.claims.as_ref()?.sub.as_deref()
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -61,15 +68,12 @@ impl Drop for StoredOAuthPayload {
 
 #[derive(Default, Deserialize)]
 struct JwtClaims {
-    #[serde(default)]
     sub: Option<String>,
 }
 
 impl Drop for JwtClaims {
     fn drop(&mut self) {
-        if let Some(ref mut subject) = self.sub {
-            subject.zeroize();
-        }
+        self.sub.zeroize();
     }
 }
 
@@ -90,16 +94,41 @@ impl Credential {
         let (Some(left), Some(right)) = (self.identity(), other.identity()) else {
             return false;
         };
-        match (&left.subject, &right.subject) {
+        match (left.subject(), right.subject()) {
             (Some(left), Some(right)) => left == right,
             _ => left.refresh_token.is_some() && left.refresh_token == right.refresh_token,
         }
     }
 
     pub fn has_conflicting_subject(&self, other: &Self) -> bool {
-        let left = self.identity().and_then(|identity| identity.subject);
-        let right = other.identity().and_then(|identity| identity.subject);
-        matches!((left, right), (Some(left), Some(right)) if left != right)
+        let left = self.identity();
+        let right = other.identity();
+        matches!(
+            (left.as_ref().and_then(SessionIdentity::subject), right.as_ref().and_then(SessionIdentity::subject)),
+            (Some(left), Some(right)) if left != right
+        )
+    }
+
+    /// Reject a stale cache entry when a slot is loaded with different credentials.
+    pub fn quota_binding(&self) -> String {
+        let identity = self.identity();
+        let mut hash = Sha256::new();
+        hash.update(b"AGASL quota slot v3\0");
+        hash.update((self.user.len() as u64).to_le_bytes());
+        hash.update(self.user.as_bytes());
+        if let Some(subject) = identity.as_ref().and_then(SessionIdentity::subject) {
+            hash.update(b"subject\0");
+            hash.update(subject.as_bytes());
+        } else if let Some(refresh_token) =
+            identity.as_ref().and_then(|id| id.refresh_token.as_ref())
+        {
+            hash.update(b"refresh\0");
+            hash.update(refresh_token.as_bytes());
+        } else {
+            hash.update(b"opaque\0");
+            hash.update(self.secret.as_slice());
+        }
+        format!("{:x}", hash.finalize())
     }
 
     fn identity(&self) -> Option<SessionIdentity> {
@@ -113,7 +142,7 @@ impl Credential {
         };
 
         let parsed: StoredOAuthPayload = serde_json::from_str(json_text).ok()?;
-        let subject = parsed.id_token.as_deref().and_then(extract_jwt_sub);
+        let claims = parsed.id_token.as_deref().and_then(extract_jwt_claims);
         let refresh_token = parsed
             .token
             .as_ref()
@@ -122,13 +151,13 @@ impl Credential {
             .filter(|value| !value.is_empty())
             .map(|value| Zeroizing::new(value.to_owned()));
         Some(SessionIdentity {
-            subject,
+            claims,
             refresh_token,
         })
     }
 }
 
-fn extract_jwt_sub(jwt: &str) -> Option<Zeroizing<String>> {
+fn extract_jwt_claims(jwt: &str) -> Option<JwtClaims> {
     let mut parts = jwt.split('.');
     let _header = parts.next()?;
     let payload_b64 = parts.next()?;
@@ -143,13 +172,16 @@ fn extract_jwt_sub(jwt: &str) -> Option<Zeroizing<String>> {
             .ok()?,
     );
     let payload_text = std::str::from_utf8(decoded.as_slice()).ok()?;
-    let claims: JwtClaims = serde_json::from_str(payload_text).ok()?;
-    let sub = claims
-        .sub
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Some(Zeroizing::new(sub.to_owned()))
+    let mut claims: JwtClaims = serde_json::from_str(payload_text).ok()?;
+    if let Some(subject) = claims.sub.as_mut() {
+        let trimmed = subject.trim();
+        if trimmed.is_empty() || trimmed.len() != subject.len() {
+            let normalized = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+            subject.zeroize();
+            claims.sub = normalized;
+        }
+    }
+    Some(claims)
 }
 
 impl Vault<'static> {
@@ -361,6 +393,7 @@ mod tests {
         let rt_only_v1 = build_cred(false, None, "rt-stable", "at-1");
         let rt_only_v2 = build_cred(true, None, "rt-stable", "at-2");
         assert!(rt_only_v1.same_account(&rt_only_v2));
+        assert_eq!(rt_only_v1.quota_binding(), rt_only_v2.quota_binding());
 
         let subject_and_rt = build_cred(false, Some("google-uid-1"), "rt-stable", "at-1");
         let conflicting_sub = build_cred(false, Some("google-uid-2"), "rt-stable", "at-1");
@@ -369,5 +402,15 @@ mod tests {
         assert!(rt_only_v2.same_account(&subject_and_rt));
         assert!(!subject_and_rt.same_account(&conflicting_sub));
         assert!(!rt_only_v1.same_account(&rotated_rt_only));
+        let same_subject_rotated = build_cred(true, Some("google-uid-1"), "rt-new", "at-2");
+        assert_eq!(
+            subject_and_rt.quota_binding(),
+            same_subject_rotated.quota_binding()
+        );
+        assert_ne!(
+            subject_and_rt.quota_binding(),
+            conflicting_sub.quota_binding()
+        );
+        assert_ne!(rt_only_v1.quota_binding(), rotated_rt_only.quota_binding());
     }
 }

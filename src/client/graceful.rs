@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM},
+    Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_NOT_ENOUGH_QUOTA, HWND, LPARAM},
     UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible,
         PostMessageW, GWL_EXSTYLE, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
@@ -59,67 +59,82 @@ fn is_app_user_window(window: HWND) -> bool {
     is_app_window || !is_non_interactive_overlay
 }
 
-fn count_visible_windows(pids: &[u32]) -> usize {
+#[derive(Clone, Copy)]
+struct AppWindow {
+    handle: HWND,
+    pid: u32,
+    thread: u32,
+}
+
+impl AppWindow {
+    fn still_visible(self) -> bool {
+        let mut pid = 0;
+        let thread = unsafe { GetWindowThreadProcessId(self.handle, &mut pid) };
+        pid == self.pid && thread == self.thread && is_app_user_window(self.handle)
+    }
+}
+
+fn visible_windows(pids: &[u32]) -> Result<Vec<AppWindow>, &'static str> {
     struct Ctx<'a> {
         pids: &'a [u32],
-        count: usize,
+        windows: Vec<AppWindow>,
     }
 
     unsafe extern "system" fn visit(window: HWND, data: LPARAM) -> i32 {
         let ctx = unsafe { &mut *(data as *mut Ctx<'_>) };
         let mut pid = 0u32;
-        unsafe { GetWindowThreadProcessId(window, &mut pid) };
-        if pid != 0 && ctx.pids.contains(&pid) && is_app_user_window(window) {
-            ctx.count += 1;
+        let thread = unsafe { GetWindowThreadProcessId(window, &mut pid) };
+        if thread != 0 && ctx.pids.contains(&pid) && is_app_user_window(window) {
+            ctx.windows.push(AppWindow {
+                handle: window,
+                pid,
+                thread,
+            });
         }
         1
     }
 
-    let mut ctx = Ctx { pids, count: 0 };
-    unsafe {
-        let _ = EnumWindows(Some(visit), (&mut ctx as *mut Ctx<'_>) as LPARAM);
+    let mut ctx = Ctx {
+        pids,
+        windows: Vec::new(),
+    };
+    if unsafe { EnumWindows(Some(visit), (&mut ctx as *mut Ctx<'_>) as LPARAM) } == 0 {
+        return Err("client_state_unknown");
     }
-    ctx.count
+    Ok(ctx.windows)
 }
 
-struct PostOutcome {
-    posted: usize,
-    failed: bool,
+fn post_close_message(window: HWND) -> Result<(), u32> {
+    if unsafe { PostMessageW(window, WM_CLOSE, 0, 0) } != 0 {
+        Ok(())
+    } else {
+        Err(unsafe { GetLastError() })
+    }
 }
 
-fn post_close_to_visible_windows(pids: &[u32]) -> PostOutcome {
-    struct CloseCtx<'a> {
-        pids: &'a [u32],
-        posted: usize,
-        failed: bool,
-    }
-
-    unsafe extern "system" fn visit(window: HWND, data: LPARAM) -> i32 {
-        let ctx = unsafe { &mut *(data as *mut CloseCtx<'_>) };
-        let mut pid = 0u32;
-        unsafe { GetWindowThreadProcessId(window, &mut pid) };
-        if pid != 0 && ctx.pids.contains(&pid) && is_app_user_window(window) {
-            if unsafe { PostMessageW(window, WM_CLOSE, 0, 0) } != 0 {
-                ctx.posted += 1;
-            } else if is_app_user_window(window) {
-                ctx.failed = true;
+fn post_close_to_visible_windows(
+    windows: &[AppWindow],
+    mut post: impl FnMut(HWND) -> Result<(), u32>,
+) -> Result<(), &'static str> {
+    // Use the initial window list, so a new dialog opened in response to WM_CLOSE
+    // is checked by the visibility gate and never receives another close request.
+    for window in windows {
+        for attempt in 0..2 {
+            if !window.still_visible() {
+                break;
+            }
+            match post(window.handle) {
+                Ok(()) => break,
+                Err(_) if !window.still_visible() => break,
+                Err(ERROR_NOT_ENOUGH_QUOTA) if attempt == 0 => {
+                    thread::sleep(Duration::from_millis(50))
+                }
+                Err(ERROR_ACCESS_DENIED) => return Err("close_message_denied"),
+                Err(_) => return Err("close_failed"),
             }
         }
-        1
     }
-
-    let mut ctx = CloseCtx {
-        pids,
-        posted: 0,
-        failed: false,
-    };
-    unsafe {
-        let _ = EnumWindows(Some(visit), (&mut ctx as *mut CloseCtx<'_>) as LPARAM);
-    }
-    PostOutcome {
-        posted: ctx.posted,
-        failed: ctx.failed,
-    }
+    Ok(())
 }
 
 /// Phase 1 of silent shutdown: send `WM_CLOSE` to visible Antigravity windows so
@@ -133,8 +148,8 @@ pub fn close_windows_gracefully(
     is_closed: impl Fn() -> Result<(), &'static str>,
     timeout: Duration,
 ) -> Result<GracefulExit, &'static str> {
-    let initial_visible = count_visible_windows(app_pids);
-    if initial_visible == 0 {
+    let windows = visible_windows(app_pids)?;
+    if windows.is_empty() {
         return match is_closed() {
             Ok(()) => Ok(GracefulExit::ProcessExited),
             Err("client_running") => Ok(GracefulExit::HiddenToTray),
@@ -142,17 +157,7 @@ pub fn close_windows_gracefully(
         };
     }
 
-    let outcome = post_close_to_visible_windows(app_pids);
-    if outcome.failed {
-        return Err("close_failed");
-    }
-    if outcome.posted == 0 && count_visible_windows(app_pids) == 0 {
-        return match is_closed() {
-            Ok(()) => Ok(GracefulExit::ProcessExited),
-            Err("client_running") => Ok(GracefulExit::HiddenToTray),
-            Err(reason) => Err(reason),
-        };
-    }
+    post_close_to_visible_windows(&windows, post_close_message)?;
 
     let deadline = Instant::now() + timeout;
     let settle_window = Duration::from_millis(450).min(timeout);
@@ -162,7 +167,7 @@ pub fn close_windows_gracefully(
         match is_closed() {
             Ok(()) => return Ok(GracefulExit::ProcessExited),
             Err("client_running") => {
-                if count_visible_windows(app_pids) == 0 {
+                if visible_windows(app_pids)?.is_empty() {
                     let hidden_at = *windows_hidden_since.get_or_insert_with(Instant::now);
                     if hidden_at.elapsed() >= settle_window {
                         return Ok(GracefulExit::HiddenToTray);
@@ -179,7 +184,7 @@ pub fn close_windows_gracefully(
     match is_closed() {
         Ok(()) => Ok(GracefulExit::ProcessExited),
         Err("client_running") => {
-            if count_visible_windows(app_pids) > 0 {
+            if !visible_windows(app_pids)?.is_empty() {
                 return Err("close_timeout");
             }
             if let Some(hidden_at) = windows_hidden_since {
@@ -188,7 +193,7 @@ pub fn close_windows_gracefully(
                     thread::sleep(remaining_settle);
                 }
             }
-            if count_visible_windows(app_pids) > 0 {
+            if !visible_windows(app_pids)?.is_empty() {
                 return Err("close_timeout");
             }
             match is_closed() {
@@ -284,9 +289,36 @@ mod tests {
         };
         assert!(!overlay.is_null());
 
-        let outcome = post_close_to_visible_windows(&[std::process::id()]);
-        assert!(!outcome.failed);
-        assert_eq!(outcome.posted, 1);
+        let windows = visible_windows(&[std::process::id()]).unwrap();
+        let [target] = windows.as_slice() else {
+            panic!("expected only the user window")
+        };
+        let stale = AppWindow {
+            thread: 0,
+            ..*target
+        };
+        assert_eq!(
+            post_close_to_visible_windows(&[stale], |_| panic!("changed window owner")),
+            Ok(())
+        );
+        let mut calls = 0;
+        assert_eq!(
+            post_close_to_visible_windows(&windows, |_| {
+                calls += 1;
+                if calls == 1 {
+                    Err(ERROR_NOT_ENOUGH_QUOTA)
+                } else {
+                    Ok(())
+                }
+            }),
+            Ok(())
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            post_close_to_visible_windows(&windows, |_| Err(ERROR_ACCESS_DENIED)),
+            Err("close_message_denied")
+        );
+        post_close_to_visible_windows(&windows, post_close_message).unwrap();
 
         let mut msg: MSG = unsafe { std::mem::zeroed() };
         let visible_got_close =

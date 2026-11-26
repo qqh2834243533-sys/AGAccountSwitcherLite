@@ -30,6 +30,7 @@ jobs:
           cargo test --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify SBOM tool and package release candidate
+        id: package
         run: |
           $sbom = Join-Path $env:RUNNER_TEMP 'sbom-tool-win-x64.exe'
           $uri = 'https://github.com/microsoft/sbom-tool/releases/download/v4.1.5/sbom-tool-win-x64.exe'
@@ -39,14 +40,16 @@ jobs:
             throw 'Unexpected SBOM tool checksum.'
           }
           ./scripts/package.ps1 -CargoWrapper cargo -SbomTool $sbom
+          $version = (Get-Content -Raw -LiteralPath VERSION).Trim()
+          "stem=ag-account-switcher-lite-$version-win-x64" >> $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-x64-release-candidate
           path: |
-            artifacts/ag-account-switcher-lite-*-win-x64.zip
-            artifacts/ag-account-switcher-lite-*-win-x64.zip.sha256
-            artifacts/ag-account-switcher-lite-*-win-x64.spdx.json
-            artifacts/ag-account-switcher-lite-*-win-x64.sbom-validation.json
+            artifacts/${{ steps.package.outputs.stem }}.zip
+            artifacts/${{ steps.package.outputs.stem }}.zip.sha256
+            artifacts/${{ steps.package.outputs.stem }}.spdx.json
+            artifacts/${{ steps.package.outputs.stem }}.sbom-summary.json
             CHANGELOG.md
             NOTICE.md
           if-no-files-found: error

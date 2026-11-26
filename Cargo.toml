@@ -1,6 +1,6 @@
 [package]
 name = "ag-account-switcher-lite"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "CC-BY-NC-SA-4.0"
 description = "Manual account switching for the Windows Antigravity desktop app"
@@ -10,8 +10,11 @@ tauri-build = "=2.7.4"
 
 [dependencies]
 base64 = "=0.23.1"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.154"
+sha2 = "=0.10.9"
 sysinfo = "=0.31.4"
 tauri = { version = "=2.12.5", features = ["tray-icon"] }
 tauri-plugin-single-instance = "=2.4.0"
@@ -19,6 +22,8 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Globalization",
   "Win32_Graphics_Dwm",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
   "Win32_Security_Credentials",
   "Win32_Storage_FileSystem",
   "Win32_System_Registry",
@@ -27,7 +32,7 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
-zeroize = "=1.8.2"
+zeroize = { version = "=1.8.2", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3.10"

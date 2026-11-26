@@ -814,6 +814,135 @@ html[data-layout="list"] .slot-trigger.is-empty:hover:enabled {
   font-weight: 550;
 }
 
+.card-bottom.has-quota {
+  margin-top: 6px;
+}
+
+.has-quota .account-label {
+  margin-bottom: 6px;
+}
+
+.quota-bars {
+  --quota-bar-height: 5px;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  flex: none;
+  gap: 6px 10px;
+  color: var(--ag-muted);
+}
+
+.quota-bar-label {
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.quota-bar-pair {
+  display: grid;
+  gap: 3px;
+}
+
+.quota-bar {
+  --quota-bar-color: var(--ag-blue);
+  --quota-track-color: var(--ag-blue-soft);
+  height: var(--quota-bar-height);
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--quota-track-color);
+}
+
+.quota-bar[data-window="weekly"] {
+  --quota-bar-color: var(--ag-ok);
+  --quota-track-color: var(--ag-ok-soft);
+}
+
+.quota-bar[data-unavailable] {
+  background: var(--ag-outline-soft);
+}
+
+.quota-bar-fill {
+  display: block;
+  width: calc(var(--quota-level, 0) * 100%);
+  height: 100%;
+  border-radius: inherit;
+  background: var(--quota-bar-color);
+}
+
+.row-right .quota-bars {
+  --quota-bar-height: 4px;
+  width: 184px;
+  row-gap: 4px;
+  margin-right: 4px;
+}
+
+.quota-tooltip {
+  position: fixed;
+  z-index: 40;
+  width: min(304px, calc(100vw - 16px));
+  max-height: min(310px, calc(100vh - 16px));
+  overflow: auto;
+  padding: 11px 12px;
+  border: 1px solid var(--ag-outline);
+  border-radius: 12px;
+  background: var(--ag-card-solid);
+  box-shadow: 0 9px 28px -10px rgba(0, 0, 0, 0.45);
+  color: var(--ag-fg);
+  font-size: 11px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-tooltip-stamp {
+  color: var(--ag-muted);
+  font-size: 10px;
+}
+
+.quota-tooltip-model {
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid var(--ag-outline-soft);
+}
+
+.quota-tooltip-heading {
+  font-weight: 700;
+  margin-bottom: 2px;
+  overflow-wrap: anywhere;
+}
+
+.quota-tooltip-row {
+  display: grid;
+  grid-template-columns: 50px 74px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 0;
+}
+
+.quota-tooltip-period::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--ag-blue);
+  vertical-align: 2px;
+}
+
+.quota-tooltip-period[data-window="weekly"]::before {
+  background: var(--ag-ok);
+}
+
+.quota-tooltip-amount {
+  font-weight: 650;
+}
+
+.quota-tooltip-reset {
+  color: var(--ag-muted);
+  text-align: right;
+}
+
 /* List Row Specific Inner Layout */
 .row-left {
   display: flex;

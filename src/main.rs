@@ -2,6 +2,7 @@
 
 mod client;
 mod config_file;
+mod quota;
 mod service;
 mod shell;
 mod switch_lock;
@@ -65,10 +66,13 @@ async fn overview(app: AppHandle) -> Reply<Overview> {
     let shell_status = shell_status(app.clone())?;
     with_vault(app, false, move |vault, root| {
         let installed = client::installed();
+        let client_running = client::inspect_running(installed.as_deref(), root);
+        let mut accounts = service::status(vault)?;
+        accounts.apply_quota_cache(&quota::Cache::load(root), client_running);
         Ok(Overview {
             app_installed: installed.is_some(),
-            client_running: client::inspect_running(installed.as_deref(), root),
-            accounts: service::status(vault)?,
+            client_running,
+            accounts,
             shell: shell_status,
         })
     })
@@ -98,16 +102,30 @@ async fn remove_account(app: AppHandle, slot: u8) -> Reply<()> {
 }
 
 #[tauri::command]
-async fn switch_account(app: AppHandle, slot: u8) -> Reply<()> {
+async fn switch_account(
+    app: AppHandle,
+    slot: u8,
+    confirmed_source_slot: Option<u8>,
+) -> Reply<Option<quota::CaptureError>> {
     with_vault(app, true, move |vault, root| {
         let executable = client::installed().ok_or("app_missing")?;
+        let mut quota_error = None;
         service::switch(
             vault,
             slot,
-            || client::prepare_switch(&executable, root),
+            || {
+                quota_error = confirmed_source_slot.and_then(|source| {
+                    service::sample_outgoing_quota(vault, source, slot, root, || {
+                        client::capture_quota(&executable)
+                    })
+                    .err()
+                });
+                client::prepare_switch(&executable, root)
+            },
             || client::require_closed_for(Some(&executable)),
             |plan| client::open(&executable, &plan),
-        )
+        )?;
+        Ok(quota_error)
     })
     .await
 }

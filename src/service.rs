@@ -1,6 +1,7 @@
+use crate::quota::{Cache, CaptureError, Snapshot};
 use crate::vault::{Credential, Vault};
 use serde::Serialize;
-use std::io;
+use std::{io, path::Path};
 use zeroize::Zeroizing;
 
 pub const SLOTS: std::ops::RangeInclusive<u8> = 1..=4;
@@ -10,6 +11,10 @@ type Result<T> = std::result::Result<T, &'static str>;
 pub struct Account {
     slot: u8,
     label: String,
+    #[serde(skip)]
+    quota_binding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota: Option<Snapshot>,
 }
 
 #[derive(Serialize)]
@@ -21,6 +26,19 @@ pub struct Status {
     recovery: Option<&'static str>,
     pending_slot: Option<u8>,
     can_restore: bool,
+}
+
+impl Status {
+    pub fn apply_quota_cache(&mut self, cache: &Cache, client_running: bool) {
+        if self.recovery == Some("pending") || (client_running && self.active_slot.is_none()) {
+            return;
+        }
+        for account in &mut self.accounts {
+            if Some(account.slot) != self.active_slot {
+                account.quota = cache.get(account.slot, &account.quota_binding).cloned();
+            }
+        }
+    }
 }
 
 struct Journal {
@@ -110,7 +128,9 @@ pub fn status(vault: &Vault<'_>) -> Result<Status> {
             }
             accounts.push(Account {
                 slot,
+                quota_binding: saved.quota_binding(),
                 label: saved.comment,
+                quota: None,
             });
         }
     }
@@ -233,6 +253,41 @@ fn sync_refreshed_slot(vault: &Vault<'_>, active: &Credential) -> Result<()> {
     Ok(())
 }
 
+/// Called in the switch lock after validating the target, while the old App is still running.
+pub fn sample_outgoing_quota(
+    vault: &Vault<'_>,
+    confirmed_source: u8,
+    target_slot: u8,
+    root: &Path,
+    capture: impl FnOnce() -> Option<Snapshot>,
+) -> std::result::Result<(), CaptureError> {
+    let outgoing = || {
+        let active = vault.active().ok()??;
+        let target = vault.slot(target_slot).ok()??;
+        if confirmed_source == target_slot || active.same_account(&target) {
+            return None;
+        }
+        let mut matched_slot = None;
+        for slot in SLOTS {
+            let saved = vault.slot(slot).ok()?;
+            if saved.is_some_and(|saved| saved.same_account(&active))
+                && matched_slot.replace(slot).is_some()
+            {
+                return None;
+            }
+        }
+        (matched_slot == Some(confirmed_source)).then_some(active)
+    };
+    let before = outgoing().ok_or(CaptureError::SourceSlotChanged)?;
+    let snapshot = capture().ok_or(CaptureError::Unavailable)?;
+    // A separate official client may change the shared keyring outside our switch lock.
+    let after = outgoing()
+        .filter(|current| current.same_account(&before))
+        .ok_or(CaptureError::SourceSlotChanged)?;
+    Cache::store(root, confirmed_source, after.quota_binding(), snapshot)
+        .map_err(|_| CaptureError::Unavailable)
+}
+
 pub fn switch<P>(
     vault: &Vault<'_>,
     slot: u8,
@@ -352,6 +407,7 @@ pub fn discard_recovery(vault: &Vault<'_>, closed: impl Fn() -> Result<()>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose, Engine as _};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -404,6 +460,105 @@ mod tests {
             .unwrap()
             .unwrap()
             .same_session(&fake_session(value))
+    }
+
+    #[test]
+    fn quota_uses_the_outgoing_slot_even_without_an_id_token() {
+        let fixture = Fixture::new();
+        let vault = fixture.vault();
+        let dir = tempfile::tempdir().unwrap();
+        let first = quota_credential("first", true);
+        let second = quota_credential("second", false);
+        vault.update_active(&first).unwrap();
+        register(&vault, "First".into()).unwrap();
+        vault.update_active(&second).unwrap();
+        register(&vault, "Second".into()).unwrap();
+
+        assert_eq!(
+            sample_outgoing_quota(&vault, 3, 1, dir.path(), || {
+                panic!("an unmatched confirmation must not sample");
+            }),
+            Err(CaptureError::SourceSlotChanged)
+        );
+        switch(
+            &vault,
+            1,
+            || {
+                sample_outgoing_quota(&vault, 2, 1, dir.path(), fixture_snapshot).unwrap();
+                Ok(())
+            },
+            || Ok(()),
+            |()| Ok(()),
+        )
+        .unwrap();
+
+        let cache = Cache::load(dir.path());
+        assert!(cache.get(1, &first.quota_binding()).is_none());
+        assert!(cache.get(2, &second.quota_binding()).is_some());
+        let mut first_active = status(&vault).unwrap();
+        first_active.apply_quota_cache(&cache, true);
+        assert!(first_active.accounts[0].quota.is_none());
+        assert!(first_active.accounts[1].quota.is_some());
+        let ui = serde_json::to_string(&first_active).unwrap();
+        assert!(!ui.contains(&second.quota_binding()));
+
+        switch(&vault, 2, || Ok(()), || Ok(()), |()| Ok(())).unwrap();
+        let mut second_active = status(&vault).unwrap();
+        second_active.apply_quota_cache(&cache, true);
+        assert!(second_active.accounts[1].quota.is_none());
+        assert!(cache.get(2, &second.quota_binding()).is_some());
+
+        discard_recovery(&vault, || Ok(())).unwrap();
+        let replacement = quota_credential("replacement", false);
+        vault.update_active(&replacement).unwrap();
+        update_saved_account(&vault, 2, || Ok(())).unwrap();
+        switch(&vault, 1, || Ok(()), || Ok(()), |()| Ok(())).unwrap();
+        let mut rebound = status(&vault).unwrap();
+        rebound.apply_quota_cache(&cache, true);
+        assert!(rebound.accounts[1].quota.is_none());
+    }
+
+    #[test]
+    fn quota_is_discarded_when_the_active_slot_changes_during_sampling() {
+        let fixture = Fixture::new();
+        let vault = fixture.vault();
+        let dir = tempfile::tempdir().unwrap();
+        let target = quota_credential("target", true);
+        vault.update_active(&target).unwrap();
+        register(&vault, "Target".into()).unwrap();
+        vault
+            .update_active(&quota_credential("source", false))
+            .unwrap();
+        register(&vault, "Source".into()).unwrap();
+
+        assert_eq!(
+            sample_outgoing_quota(&vault, 2, 1, dir.path(), || {
+                vault.update_active(&target).unwrap();
+                fixture_snapshot()
+            }),
+            Err(CaptureError::SourceSlotChanged)
+        );
+        assert!(!dir.path().join("quota-cache.json").exists());
+    }
+
+    fn fixture_snapshot() -> Option<Snapshot> {
+        Snapshot::from_summary(
+            br#"{"response":{"groups":[{"buckets":[{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.5}]}]}}"#,
+        )
+    }
+
+    fn quota_credential(name: &str, with_id_token: bool) -> Credential {
+        let claims = serde_json::json!({ "sub": name });
+        let claims = general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        let raw = serde_json::json!({
+            "id_token": with_id_token.then(|| format!("header.{claims}.signature")),
+            "token": {"refresh_token": format!("fixture-refresh-{name}")}
+        });
+        Credential {
+            secret: Zeroizing::new(raw.to_string().into_bytes()),
+            user: "fixture".into(),
+            comment: String::new(),
+        }
     }
 
     #[test]

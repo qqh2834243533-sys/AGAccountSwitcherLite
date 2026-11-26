@@ -15,10 +15,12 @@ use windows_sys::Win32::{
 
 mod graceful;
 mod installation;
+mod quota_rpc;
 mod terminate;
 
 use graceful::GracefulExit;
 pub use installation::installed;
+pub use quota_rpc::capture_quota;
 
 const LAUNCH_CONTEXT_FILE: &str = "launch-context.json";
 
@@ -528,7 +530,16 @@ fn has_path(process: &Process, executable: &Path) -> bool {
         .is_some_and(|path| same_image_path(path, executable))
 }
 
-pub fn prepare_switch(executable: &Path, data_root: &Path) -> Result<LaunchPlan, &'static str> {
+struct ShutdownTargets {
+    app_pids: Vec<u32>,
+    targets: Vec<terminate::Target>,
+    plan: LaunchPlan,
+}
+
+fn shutdown_targets(
+    executable: &Path,
+    data_root: &Path,
+) -> Result<Option<ShutdownTargets>, &'static str> {
     let snapshot = ProcessSnapshot::read(
         ProcessRefreshKind::new()
             .with_exe(UpdateKind::Always)
@@ -536,7 +547,7 @@ pub fn prepare_switch(executable: &Path, data_root: &Path) -> Result<LaunchPlan,
     )?;
     let writers: Vec<_> = snapshot.writers(Some(executable)).collect();
     if writers.is_empty() {
-        return Ok(load_launch_plan(data_root));
+        return Ok(None);
     }
     let app_pids: Vec<u32> = writers
         .iter()
@@ -560,6 +571,26 @@ pub fn prepare_switch(executable: &Path, data_root: &Path) -> Result<LaunchPlan,
     let plan = snapshot
         .capture_launch_plan(executable, &app_pids)
         .unwrap_or_else(|| load_launch_plan(data_root));
+    Ok(Some(ShutdownTargets {
+        app_pids,
+        targets,
+        plan,
+    }))
+}
+
+pub fn prepare_switch(executable: &Path, data_root: &Path) -> Result<LaunchPlan, &'static str> {
+    let prepared = match shutdown_targets(executable, data_root) {
+        Err("close_process_gone") => shutdown_targets(executable, data_root),
+        result => result,
+    }?;
+    let Some(ShutdownTargets {
+        app_pids,
+        targets,
+        plan,
+    }) = prepared
+    else {
+        return Ok(load_launch_plan(data_root));
+    };
     save_launch_args(data_root, &plan.app_args, None);
 
     // Phase 1: silently close visible windows via WM_CLOSE so renderer state flushes

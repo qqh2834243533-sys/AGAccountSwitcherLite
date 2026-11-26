@@ -35,6 +35,36 @@ $pathRemaps[$root] = '/agasl/source'
 if ($cargoHome) { $pathRemaps[$cargoHome] = '/agasl/cargo' }
 if ($env:RUSTUP_HOME) { $pathRemaps[$env:RUSTUP_HOME] = '/agasl/rustup' }
 
+$privatePaths = @($pathRemaps.Keys) + @($env:USERPROFILE, $env:TEMP, $env:TMP)
+$privatePathPrefixes = @($privatePaths | Where-Object { $_ } | ForEach-Object {
+    $_.TrimEnd('\', '/').Replace('\', '/') + '/'
+} | Select-Object -Unique)
+$profilePathPattern = '(?i)(?:\b[A-Z]:/Users/|(?<![\w/])/(?:Users|home)/)[^/<>"\x00-\x1f]+/'
+$secretPattern = '-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----|\b(?:ghp_|github_pat_|gho_|ghs_|ya29\.|AIza)[A-Za-z0-9_.-]{20,}|\b1//[A-Za-z0-9_-]{24,}'
+$emailPattern = '(?i)\b[A-Z0-9._%+-]+@(?!example\.(?:test|com)\b|users\.noreply\.github\.com\b)[A-Z0-9.-]+\.[A-Z]{2,}\b'
+
+function Assert-PublishableContent([string]$Name, [byte[]]$Bytes) {
+    $views = @([Text.Encoding]::UTF8.GetString($Bytes))
+    if ($Name -like '*.exe' -and $Bytes.Length -gt 1) {
+        $views += [Text.Encoding]::Unicode.GetString($Bytes)
+        $views += [Text.Encoding]::Unicode.GetString($Bytes, 1, $Bytes.Length - 1)
+    }
+    foreach ($view in $views) {
+        $normalized = $view.Replace('\', '/') -replace '/{2,}', '/'
+        foreach ($prefix in $privatePathPrefixes) {
+            if ($normalized.IndexOf($prefix, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw "Release privacy check failed for '$Name' (local path)."
+            }
+        }
+        if ($normalized -match $profilePathPattern) {
+            throw "Release privacy check failed for '$Name' (user profile path)."
+        }
+        if ($view -cmatch $secretPattern -or $view -match $emailPattern) {
+            throw "Release privacy check failed for '$Name' (credential or email pattern)."
+        }
+    }
+}
+
 if (-not $NoBuild) {
     $buildArgs = @('build', '--locked', '--release', '--manifest-path', (Join-Path $root 'Cargo.toml'))
     if ($Offline) {
@@ -73,25 +103,6 @@ if (-not (Test-Path -LiteralPath $builtExe)) {
     throw "Expected compiled executable not found at $builtExe"
 }
 
-# Rust source remapping is best effort. Also check the actual distributable PE.
-$binary = [IO.File]::ReadAllBytes($builtExe)
-$binaryStrings = @(
-    [Text.Encoding]::UTF8.GetString($binary)
-    [Text.Encoding]::Unicode.GetString($binary)
-    [Text.Encoding]::Unicode.GetString($binary, 1, $binary.Length - 1)
-)
-foreach ($directory in @($pathRemaps.Keys) + @($env:USERPROFILE)) {
-    if (!$directory) { continue }
-    $native = $directory.TrimEnd('\', '/') + '\'
-    $portable = $native.Replace('\', '/')
-    if ($binaryStrings | Where-Object {
-        $_.IndexOf($native, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
-        $_.IndexOf($portable, [StringComparison]::OrdinalIgnoreCase) -ge 0
-    }) {
-        throw 'The release executable still contains a local build path. Rebuild with this packaging script before publishing.'
-    }
-}
-
 $artifacts = Join-Path $root 'artifacts'
 $runId = [guid]::NewGuid().ToString()
 $stagingRoot = Join-Path $root '.local\packaging'
@@ -99,11 +110,15 @@ $runRoot = Join-Path $stagingRoot $runId
 $staging = Join-Path $runRoot 'drop'
 $componentScan = Join-Path $runRoot 'components'
 $stem = "ag-account-switcher-lite-$version-win-x64"
-$zip = Join-Path $artifacts "$stem.zip"
+$zip = Join-Path $runRoot "$stem.zip"
+$shipFiles = @($exeName, 'LICENSE', 'NOTICE.md', 'README.md', 'README.en.md')
+$sidecars = @("$stem.zip.sha256")
 New-Item -ItemType Directory -Force -Path $artifacts, $staging, $componentScan | Out-Null
 
 try {
-    foreach ($file in @($builtExe, (Join-Path $root 'LICENSE'), (Join-Path $root 'NOTICE.md'), (Join-Path $root 'README.md'), (Join-Path $root 'README.en.md'))) {
+    Assert-PublishableContent $exeName ([IO.File]::ReadAllBytes($builtExe))
+    Assert-PublishableContent 'CHANGELOG.md' ([IO.File]::ReadAllBytes((Join-Path $root 'CHANGELOG.md')))
+    foreach ($file in @($builtExe) + @($shipFiles | Where-Object { $_ -ne $exeName } | ForEach-Object { Join-Path $root $_ })) {
         Copy-Item -LiteralPath $file -Destination $staging -Force
     }
 
@@ -117,38 +132,55 @@ try {
             throw "SBOM generation failed ($LASTEXITCODE)"
         }
 
-        & $SbomTool validate -b $staging -o (Join-Path $artifacts "$stem.sbom-validation.json") -mi 'SPDX:2.2'
+        $rawValidation = Join-Path $runRoot 'sbom-validation.json'
+        & $SbomTool validate -b $staging -o $rawValidation -mi 'SPDX:2.2'
         if ($LASTEXITCODE -ne 0) {
             throw "SBOM validation failed ($LASTEXITCODE)"
         }
-        Copy-Item -LiteralPath (Join-Path $staging '_manifest\spdx_2.2\manifest.spdx.json') -Destination (Join-Path $artifacts "$stem.spdx.json") -Force
+        $report = Get-Content -Raw -LiteralPath $rawValidation | ConvertFrom-Json
+        $counts = $report.Summary.ValidationTelemetery
+        $successful = [int]$counts.FilesSuccessfulCount
+        $failed = [int]$counts.FilesFailedCount
+        if ($successful -ne $shipFiles.Count -or $failed -ne 0 -or [int]$counts.TotalFilesInManifest -ne $successful) {
+            throw 'SBOM validation did not cover every release payload file.'
+        }
+        [ordered]@{
+            status = 'passed'
+            filesValidated = $successful
+            filesFailed = $failed
+        } | ConvertTo-Json | Set-Content -Encoding ascii -LiteralPath (Join-Path $runRoot "$stem.sbom-summary.json")
+        Copy-Item -LiteralPath (Join-Path $staging '_manifest\spdx_2.2\manifest.spdx.json') -Destination (Join-Path $runRoot "$stem.spdx.json")
+        $shipFiles += '_manifest/spdx_2.2/manifest.spdx.json', '_manifest/spdx_2.2/manifest.spdx.json.sha256'
+        $sidecars += "$stem.spdx.json", "$stem.sbom-summary.json"
     }
 
-    if (Test-Path -LiteralPath $zip) {
-        Remove-Item -LiteralPath $zip -Force
-    }
     Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip -CompressionLevel Optimal -Force
 
-    # Round-trip verify the packaged executable matches the built Release binary byte-for-byte
-    # Compatible with both Windows PowerShell 5.1 (.NET Framework) and PowerShell 7+ (.NET)
-    $expectedExeHash = (Get-FileHash -LiteralPath $builtExe -Algorithm SHA256).Hash.ToUpperInvariant()
+    # Verify the final archive contents before exposing any output files.
+    $expectedExeHash = (Get-FileHash -LiteralPath $builtExe -Algorithm SHA256).Hash
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [IO.Compression.ZipFile]::OpenRead($zip)
     try {
-        $entry = $archive.GetEntry($exeName)
-        if (-not $entry) {
-            throw "Packaged archive is missing $exeName"
+        $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+        if (@(Compare-Object -ReferenceObject $shipFiles -DifferenceObject $entryNames -CaseSensitive).Count -ne 0) {
+            throw 'Release ZIP contents differ from the expected file list.'
         }
-        $stream = $entry.Open()
-        $hasher = [System.Security.Cryptography.SHA256]::Create()
-        try {
-            $zippedExeHash = ([BitConverter]::ToString($hasher.ComputeHash($stream))).Replace('-', '').ToUpperInvariant()
-            if ($zippedExeHash -ne $expectedExeHash) {
-                throw "Archive verification failed: expected $expectedExeHash, got $zippedExeHash"
+        foreach ($entry in $archive.Entries) {
+            $stream = $entry.Open()
+            $buffer = New-Object IO.MemoryStream
+            try {
+                $stream.CopyTo($buffer)
+                Assert-PublishableContent ($entry.FullName.Replace('\', '/')) ($buffer.ToArray())
+                if ($entry.FullName -ceq $exeName) {
+                    $buffer.Position = 0
+                    if ((Get-FileHash -InputStream $buffer -Algorithm SHA256).Hash -ne $expectedExeHash) {
+                        throw 'The archived executable differs from the Release build.'
+                    }
+                }
+            } finally {
+                $buffer.Dispose()
+                $stream.Dispose()
             }
-        } finally {
-            $hasher.Dispose()
-            $stream.Dispose()
         }
     } finally {
         $archive.Dispose()
@@ -156,7 +188,13 @@ try {
 
     $sha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -Encoding ascii -LiteralPath ($zip + '.sha256') -Value "$sha256 *$stem.zip"
-    Write-Output $zip
+    foreach ($name in $sidecars) {
+        Assert-PublishableContent $name ([IO.File]::ReadAllBytes((Join-Path $runRoot $name)))
+    }
+    foreach ($name in @("$stem.zip") + $sidecars) {
+        Move-Item -LiteralPath (Join-Path $runRoot $name) -Destination (Join-Path $artifacts $name) -Force
+    }
+    Write-Output (Join-Path $artifacts "$stem.zip")
 } finally {
     if (Test-Path -LiteralPath $runRoot) {
         $resolvedRun = (Resolve-Path -LiteralPath $runRoot).ProviderPath

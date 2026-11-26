@@ -4,11 +4,12 @@
 
 **AG Account Switcher Lite (`ag-account-switcher-lite`)** is an unofficial manual four-account switcher for the Windows 11 x64 Antigravity desktop app, built with Rust and Tauri 2.
 
-It has no built-in OAuth server, no bundled client secrets, no quota polling, no model API proxy, and no workspace or conversation database writes. Initial sign-in and re-authentication are always handled by the official Antigravity app and official browser flow.
+Initial sign-in and re-authentication use the official Antigravity app and browser flow. The pre-switch quota snapshot comes from the running desktop client's loopback interface.
 
 ## Key Capabilities
 
-- **Four-Slot Windows Credential Vault**: Save up to 4 accounts signed in through the official Antigravity app. Credentials and rollback state stay inside the current Windows user's Credential Manager (`CRED_TYPE_GENERIC`), while the WebView2 UI receives only slot numbers and labels.
+- **Four-Slot Windows Credential Vault.** Save up to 4 accounts signed in through the official Antigravity app. Credentials and rollback state stay inside the current Windows user's Credential Manager (`CRED_TYPE_GENERIC`).
+- **Pre-switch quota snapshots.** The app records five-hour and weekly balances for the slot that uniquely matches the active credential. Inactive slots show the last recorded balances and display `100% est.` when each window resets. If the app cannot confirm the outgoing slot, it skips the snapshot and continues the switch.
 - **Active Slot Detection & Refreshed Token Sync**: Highlights the currently active registered slot and automatically writes official background-refreshed tokens back to their matching slot before switching or restoring.
 - **Window-Safe Shutdown Gate (1-A)**:
   - When Antigravity is closed: switches credentials and launches the app in a single click.

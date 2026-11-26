@@ -4,11 +4,14 @@ use std::{
         ffi::OsStringExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use sysinfo::Process;
 use windows_sys::Win32::{
-    Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{
+        GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    },
     System::Threading::{
         GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
         WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -20,36 +23,51 @@ pub(super) struct Target(OwnedHandle);
 
 impl Target {
     pub(super) fn open(process: &Process) -> Result<Self, &'static str> {
+        Self::open_with_access(process, PROCESS_TERMINATE)
+    }
+
+    pub(super) fn observe(process: &Process) -> Result<Self, &'static str> {
+        Self::open_with_access(process, 0)
+    }
+
+    fn open_with_access(process: &Process, access: u32) -> Result<Self, &'static str> {
         let expected_path = process.exe().ok_or("client_state_unknown")?;
         let handle = unsafe {
             OpenProcess(
-                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                access | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
                 0,
                 process.pid().as_u32(),
             )
         };
         if handle.is_null() {
-            return Err("close_failed");
+            return Err(match unsafe { GetLastError() } {
+                ERROR_INVALID_PARAMETER => "close_process_gone",
+                ERROR_ACCESS_DENIED => "close_process_access_denied",
+                _ => "client_state_unknown",
+            });
         }
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let target = Self(unsafe { OwnedHandle::from_raw_handle(handle) });
+        if target.wait(0).map_err(|_| "client_state_unknown")? {
+            return Err("close_process_gone");
+        }
         let mut path = vec![0; 32768];
         let mut len = path.len() as u32;
         let read_path = unsafe {
             QueryFullProcessImageNameW(
-                handle.as_raw_handle(),
+                target.0.as_raw_handle(),
                 PROCESS_NAME_WIN32,
                 path.as_mut_ptr(),
                 &mut len,
             )
         };
         if read_path == 0 {
-            return Err("client_state_unknown");
+            return Err(target.read_error());
         }
         let actual_path = OsString::from_wide(&path[..len as usize]);
         let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
         if unsafe {
             GetProcessTimes(
-                handle.as_raw_handle(),
+                target.0.as_raw_handle(),
                 &mut created,
                 &mut exited,
                 &mut kernel,
@@ -57,7 +75,7 @@ impl Target {
             )
         } == 0
         {
-            return Err("client_state_unknown");
+            return Err(target.read_error());
         }
         let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
         let started = (ticks / 10_000_000).checked_sub(11_644_473_600);
@@ -68,14 +86,26 @@ impl Target {
         {
             return Err("client_state_changed");
         }
-        Ok(Self(handle))
+        Ok(target)
+    }
+
+    fn read_error(&self) -> &'static str {
+        if matches!(self.wait(0), Ok(true)) {
+            "close_process_gone"
+        } else {
+            "client_state_unknown"
+        }
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        matches!(self.wait(0), Ok(false))
     }
 
     fn wait(&self, milliseconds: u32) -> Result<bool, &'static str> {
         match unsafe { WaitForSingleObject(self.0.as_raw_handle(), milliseconds) } {
             WAIT_OBJECT_0 => Ok(true),
             WAIT_TIMEOUT => Ok(false),
-            _ => Err("close_failed"),
+            _ => Err("close_cleanup_failed"),
         }
     }
 }
@@ -85,8 +115,14 @@ pub(super) fn remaining(targets: &[Target], deadline: Instant) -> Result<(), &'s
         if target.wait(0)? {
             continue;
         }
-        if unsafe { TerminateProcess(target.0.as_raw_handle(), 1) } == 0 && !target.wait(0)? {
-            return Err("close_failed");
+        if unsafe { TerminateProcess(target.0.as_raw_handle(), 1) } == 0 {
+            // Windows can reject termination when a process exits on its own at this point.
+            let settle = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(120));
+            if !target.wait(settle.as_millis() as u32)? {
+                return Err("close_cleanup_failed");
+            }
         }
     }
     for target in targets {
@@ -174,6 +210,10 @@ mod tests {
         let _ = already_exited.0.kill();
         let _ = already_exited.0.wait();
 
+        assert_eq!(
+            Target::open(system.process(pid1).unwrap()).err(),
+            Some("close_process_gone")
+        );
         remaining(&[h1, h2], Instant::now() + Duration::from_secs(5)).unwrap();
         assert_eq!(still_running.0.try_wait().unwrap().unwrap().code(), Some(1));
     }
