@@ -6,7 +6,7 @@ license = "CC-BY-NC-SA-4.0"
 description = "Manual account switching for the Windows Antigravity desktop app"
 
 [build-dependencies]
-tauri-build = "=2.7.4"
+tauri-build = "=2.7.6"
 
 [dependencies]
 base64 = "=0.23.1"
